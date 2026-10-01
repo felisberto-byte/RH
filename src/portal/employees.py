@@ -49,8 +49,10 @@ def _clean(value: str) -> str:
 def parse_employees_csv(text: str) -> list[dict]:
     """CSV com cabeçalho ``matricula;nome;cpf;email;ativo`` (separador ; ou ,).
 
-    ``ativo`` vazio/ausente significa "não alterar" para quem já existe (nunca
-    reativa por omissão um colaborador desligado) e "ativo" para quem é novo.
+    Colunas opcionais vazias ou ausentes significam "não alterar" para quem já
+    existe: ``ativo`` vazio nunca reativa por omissão um desligado, e ``cpf``/
+    ``email`` vazios não apagam o que está cadastrado. Para limpar ``cpf`` ou
+    ``email`` de propósito, use ``-``. Para quem é novo, ``ativo`` vazio = ativo.
     """
     sample = text[:2048]
     try:
@@ -68,7 +70,8 @@ def parse_employees_csv(text: str) -> list[dict]:
         if mat in seen_mat:
             raise EmployeeImportError(f"Linha {i}: matrícula repetida (linha {seen_mat[mat]}).")
         seen_mat[mat] = i
-        cpf = re.sub(r"\D", "", row.get("cpf", "")) or None
+        cpf_raw = row.get("cpf", "")
+        cpf: str | None = "" if cpf_raw == "-" else (re.sub(r"\D", "", cpf_raw) or None)
         if cpf and len(cpf) != 11:
             raise EmployeeImportError(f"Linha {i}: CPF inválido.")
         if cpf:
@@ -84,7 +87,7 @@ def parse_employees_csv(text: str) -> list[dict]:
                 "matricula": mat,
                 "nome": row["nome"][:200],
                 "cpf": cpf,
-                "email": row.get("email") or None,
+                "email": "" if row.get("email") == "-" else (row.get("email") or None),
                 "ativo": None if not ativo_raw else ativo_raw in _TRUE,
             }
         )
@@ -101,7 +104,8 @@ def upsert_employees(db: Session, rows: list[dict]) -> ImportResult:
             if other is not None:
                 raise EmployeeImportError(
                     f"Linha {r['line']}: CPF já cadastrado para a matrícula {other.matricula}. "
-                    "Para readmissão com nova matrícula, limpe o CPF do vínculo antigo antes."
+                    "Para readmissão com nova matrícula, limpe antes o CPF do cadastro antigo "
+                    "(linha com a matrícula antiga e cpf '-')."
                 )
         emp = db.scalar(select(Employee).where(Employee.matricula == r["matricula"]))
         if emp is None:
@@ -114,7 +118,11 @@ def upsert_employees(db: Session, rows: list[dict]) -> ImportResult:
                 if emp.ativo and not r["ativo"]:
                     result.deactivated.append(emp.id)
                 emp.ativo = r["ativo"]
-        emp.nome, emp.cpf, emp.email = r["nome"], r["cpf"], r["email"]
+        emp.nome = r["nome"]
+        if r["cpf"] is not None:  # None = não alterar; "" = limpar
+            emp.cpf = r["cpf"] or None
+        if r["email"] is not None:
+            emp.email = r["email"] or None
         db.flush()
     for emp_id in result.deactivated:
         revoke_sessions(db, emp_id)

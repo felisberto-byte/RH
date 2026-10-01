@@ -7,7 +7,7 @@
 <section class="card">
   <h2>Importar/atualizar (CSV)</h2>
   <p class="muted small">Cabeçalho: <code>matricula;nome;cpf;email;ativo</code>. A matrícula deve ser igual ao atributo do AD configurado em <code>PORTAL_LDAP_EMPLOYEE_ID_ATTR</code> (padrão <code>employeeNumber</code>).
-    Coluna <code>ativo</code> vazia mantém a situação atual; <code>0</code>/<code>nao</code> desativa e encerra as sessões abertas.</p>
+    Colunas vazias mantêm o que já está cadastrado (<code>ativo</code> vazio nunca reativa); <code>0</code>/<code>nao</code> em <code>ativo</code> desativa e encerra as sessões abertas; <code>-</code> em <code>cpf</code>/<code>email</code> limpa o campo.</p>
   <form method="post" action="/rh/colaboradores/importar" enctype="multipart/form-data" class="inline-form">
     <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
     <label class="sr-only" for="csv">Arquivo CSV</label>

@@ -14,7 +14,6 @@ from portal.auth.dev import DevAuthProvider
 from portal.integrations.docuseal import sign_payload
 from portal.models import DocStatus, Document
 from portal.web.app import create_app
-from tests.conftest import make_pdf
 
 
 @pytest.fixture
@@ -52,18 +51,6 @@ def upload_batch(admin: TestClient, pdf: bytes, filename="folha.pdf", tipo=None)
         },
         files={"arquivo": (filename, pdf, "application/pdf")},
         follow_redirects=False,
-    )
-
-
-@pytest.fixture
-def batch_pdf():
-    return make_pdf(
-        [
-            ["HOLERITE", "Matrícula: 000123", "Maria Silva"],
-            ["(continuação) Maria"],
-            ["HOLERITE", "Matrícula: 000456", "João Souza"],
-            ["HOLERITE", "Matrícula: 999999", "Desconhecido"],
-        ]
     )
 
 
@@ -147,10 +134,10 @@ def test_end_to_end_batch_view_accept_verify(app, batch_pdf, session, tmp_path):
     v = anon.get(f"/verificar/{code}")
     assert v.status_code == 200 and "Maria S." in v.text and "Silva" not in v.text
     page = anon.get("/verificar")
-    tok = re.search(r'name="login_csrf" value="([^"]+)"', page.text).group(1)
+    tok = re.search(r'name="verify_csrf" value="([^"]+)"', page.text).group(1)
     final = maria.get(f"/documentos/{maria_doc.id}/pdf").content
     v = anon.post(
-        "/verificar", data={"login_csrf": tok}, files={"arquivo": ("x.pdf", final, "application/pdf")}
+        "/verificar", data={"verify_csrf": tok}, files={"arquivo": ("x.pdf", final, "application/pdf")}
     )
     assert v.status_code == 200 and "idêntico" in v.text
     assert "AceiteColaborador" in v.text and "NÃO" not in v.text  # assinaturas válidas

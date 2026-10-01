@@ -4,8 +4,17 @@
 {% block content %}
 <section class="card narrow">
   <h1>Verificar autenticidade</h1>
-  {% if result %}
-    <div class="alert ok">Documento localizado na base do portal.</div>
+  {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+  {% if result and result.status == "CANCELADO" %}
+    <div class="alert error" role="alert">Este documento foi <strong>cancelado</strong> pela empresa{% if result.cancelado_em %} em {{ fmt_dt(result.cancelado_em) }}{% endif %} e não tem validade. Procure o RH para obter a versão vigente.</div>
+    <dl class="facts">
+      <dt>Código</dt><dd>{{ result.codigo }}</dd>
+      <dt>Tipo</dt><dd>{{ result.tipo }}</dd>
+      <dt>Emitido em</dt><dd>{{ fmt_dt(result.emitido_em) }}</dd>
+      <dt>Situação</dt><dd>{{ status_badge(result.status) }}</dd>
+    </dl>
+  {% elif result %}
+    <div class="alert ok" role="status">Documento localizado na base do portal.</div>
     <dl class="facts">
       <dt>Código</dt><dd>{{ result.codigo }}</dd>
       <dt>Tipo</dt><dd>{{ result.tipo }}</dd>
@@ -16,10 +25,10 @@
       <dt>Emitido em</dt><dd>{{ fmt_dt(result.emitido_em) }}</dd>
       {% if result.concluido_em %}<dt>Concluído em</dt><dd>{{ fmt_dt(result.concluido_em) }}</dd>{% endif %}
       {% if result.sha256_emitido %}<dt>SHA-256 emitido</dt><dd class="mono">{{ result.sha256_emitido }}</dd>{% endif %}
-      {% if result.sha256_final %}<dt>SHA-256 com aceite</dt><dd class="mono">{{ result.sha256_final }}</dd>{% endif %}
+      {% if result.sha256_final %}<dt>SHA-256 com registro</dt><dd class="mono">{{ result.sha256_final }}</dd>{% endif %}
       {% if result.sha256_comprovante %}<dt>SHA-256 comprovante</dt><dd class="mono">{{ result.sha256_comprovante }}</dd>{% endif %}
     </dl>
-    {% if uploaded_hash %}<p class="muted small">O arquivo enviado (SHA-256 {{ uploaded_hash }}) é idêntico a uma versão registrada.</p>{% endif %}
+    {% if uploaded_hash %}<p class="muted small">O arquivo enviado (SHA-256 <span class="mono">{{ uploaded_hash }}</span>) é idêntico a uma versão registrada.</p>{% endif %}
     {% if signatures %}
     <h2>Assinaturas digitais no arquivo</h2>
     <div class="table-wrap"><table>
@@ -34,17 +43,22 @@
       </tbody></table></div>
     {% endif %}
   {% elif searched %}
-    <div class="alert error">Nenhum documento corresponde a este código ou arquivo.
-      {% if uploaded_hash %}<br><span class="mono small">SHA-256 do arquivo: {{ uploaded_hash }}</span>{% endif %}</div>
+    <div class="alert error" role="alert">Nenhum documento corresponde a este {{ "arquivo" if uploaded_hash else "código" }}.
+      {% if uploaded_hash %}<br>O arquivo pode ter sido alterado ou não ter sido emitido por este portal.
+      <br><span class="mono small">SHA-256 do arquivo: {{ uploaded_hash }}</span>{% endif %}</div>
   {% endif %}
-  {% if login_csrf %}
+
+  <form method="get" action="/verificar">
+    <label for="codigo">Código de verificação (impresso no comprovante)</label>
+    <input id="codigo" name="codigo" required maxlength="80" autocomplete="off" class="mono" placeholder="ex.: ABCD-EFGH-JKLM" value="{{ searched_code or '' }}">
+    <button class="btn full" type="submit">Consultar código</button>
+  </form>
   <form method="post" action="/verificar" enctype="multipart/form-data">
-    <input type="hidden" name="login_csrf" value="{{ login_csrf }}">
-    <label for="arquivo">Envie o PDF para comparar o hash</label>
+    <input type="hidden" name="verify_csrf" value="{{ verify_csrf }}">
+    <label for="arquivo">Ou envie o PDF para comparar o hash e conferir as assinaturas</label>
     <input id="arquivo" name="arquivo" type="file" accept="application/pdf" required>
     <button class="btn primary full" type="submit">Verificar arquivo</button>
   </form>
-  {% endif %}
   <p class="muted small">Para validar as assinaturas digitais ICP-Brasil, use também o
     Verificador de Conformidade do ITI (validar.iti.gov.br).</p>
 </section>

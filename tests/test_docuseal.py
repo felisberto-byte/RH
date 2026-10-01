@@ -29,11 +29,16 @@ class FakeDocuseal:
         self.archived: list[int] = []
         self.signed_pdf = make_pdf(["CONTRATO DE TRABALHO", "Assinado no DocuSeal"], label="")
         self.audit_pdf = make_pdf(["Trilha de auditoria DocuSeal"], label="")
+        self.annex_pdf = make_pdf(["ANEXO I - Regulamento interno"], label="")
         self.completed: set[int] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        assert request.headers["X-Auth-Token"] == "token-teste"
         path = request.url.path
+        # O token da API só vai para /api/*; downloads de arquivo não o recebem.
+        if path.startswith("/api/"):
+            assert request.headers["X-Auth-Token"] == "token-teste"
+        else:
+            assert "X-Auth-Token" not in request.headers
         if request.method == "POST" and path == "/api/submissions":
             body = json.loads(request.content)
             self.created.append(body)
@@ -63,6 +68,12 @@ class FakeDocuseal:
             return httpx.Response(200, json={})
         if path == "/file/doc.pdf":
             return httpx.Response(200, content=self.signed_pdf)
+        if path == "/file/anexo.pdf":
+            return httpx.Response(200, content=self.annex_pdf)
+        if path == "/file/rebaixa":
+            return httpx.Response(
+                302, headers={"location": "http://assinatura.empresa.test/file/doc.pdf"}
+            )
         if path == "/file/audit.pdf":
             return httpx.Response(200, content=self.audit_pdf)
         return httpx.Response(404)
@@ -181,3 +192,106 @@ def test_docuseal_webhook_ssrf_blocked(app, session):
     with pytest.raises(DocusealError):
         client.download("http://169.254.169.254/computeMetadata/v1/")
     assert re.match(r"https://", DS)
+
+
+def _issue_and_open(app, session) -> tuple[str, TestClient]:
+    admin = TestClient(app)
+    login(admin, "rh.admin")
+    tipo = session.query(DocumentType).filter_by(code="CONTRATO_DS").one().id
+    session.rollback()
+    csrf = csrf_of(admin.get("/rh").text)
+    admin.post(
+        "/rh/docuseal/emitir",
+        data={"tipo": tipo, "matriculas": "123", "titulo": "Contrato", "csrf": csrf},
+    )
+    doc_id = session.query(Document).one().id
+    session.rollback()
+    maria = TestClient(app)
+    login(maria, "maria.silva")
+    csrf = csrf_of(maria.get(f"/documentos/{doc_id}").text)
+    r = maria.post(f"/documentos/{doc_id}/docuseal", data={"csrf": csrf, "senha": "dev"})
+    assert r.status_code == 200
+    return doc_id, maria
+
+
+def test_docuseal_multiple_documents_all_sealed(app, fake, session, pki):
+    doc_id, maria = _issue_and_open(app, session)
+    payload = {
+        "event_type": "form.completed",
+        "data": {
+            "id": 101,
+            "submission_id": 11,
+            "external_id": doc_id,
+            "completed_at": "2026-10-01T12:00:00Z",
+            "documents": [
+                {"name": "contrato", "url": f"{DS}/file/doc.pdf"},
+                {"name": "anexo", "url": f"{DS}/file/anexo.pdf"},
+            ],
+        },
+    }
+    assert webhook(TestClient(app), payload).json() == {"resultado": "processado"}
+    session.rollback()
+    acc = session.query(Acceptance).one()
+    ev = json.loads(acc.evidence_json)
+    extra = ev["documento"]["arquivos_adicionais"]
+    assert len(extra) == 1 and extra[0]["nome"] == "anexo"
+    assert ev["autenticacao"]["confirmacao_ao_abrir_link"] == "senha_ad"
+    assert acc.reauth_method == "senha_ad+link_docuseal"
+    assert acc.declaration_text == "Li e concordo."
+    storage = app.state.ctx.storage
+    annex = storage.get(extra[0]["key"])
+    infos = inspect_signatures(annex, load_cert_files([pki["ca"]]))
+    assert [i.field for i in infos] == [FIELD_FINAL] and infos[0].intact
+    # o dossiê inclui o anexo selado
+    admin = TestClient(app)
+    login(admin, "rh.admin")
+    import io
+    import zipfile
+
+    z = admin.get(f"/rh/documentos/{doc_id}/dossie")
+    with zipfile.ZipFile(io.BytesIO(z.content)) as zf:
+        assert "5-adicional-1.pdf" in zf.namelist()
+
+
+def test_docuseal_decline_does_not_record_agreement(app, fake, session):
+    from portal.documents.docuseal_flow import DECLINE_DECLARATION
+
+    doc_id, _ = _issue_and_open(app, session)
+    payload = {
+        "event_type": "form.declined",
+        "data": {
+            "id": 101,
+            "submission_id": 11,
+            "external_id": doc_id,
+            "declined_at": "2026-10-01T12:00:00Z",
+            "decline_reason": "Salário diferente do combinado na entrevista",
+        },
+    }
+    assert webhook(TestClient(app), payload).json() == {"resultado": "processado"}
+    session.rollback()
+    doc = session.get(Document, doc_id)
+    acc = session.query(Acceptance).one()
+    assert doc.status == DocStatus.RECUSADO and acc.decision == "RECUSADO"
+    assert acc.declaration_text == DECLINE_DECLARATION and "concordo" not in acc.evidence_json
+    assert json.loads(acc.evidence_json)["motivo"].startswith("Salário")
+
+
+def test_docuseal_client_refuses_scheme_downgrade_and_maps_errors(fake):
+    from portal.integrations.docuseal import DocusealError
+
+    client = DocusealClient(DS, "token-teste", http=httpx.Client(transport=httpx.MockTransport(fake)))
+    with pytest.raises(DocusealError):
+        client.download("http://assinatura.empresa.test/file/doc.pdf")
+    with pytest.raises(DocusealError):  # redirecionamento https -> http no mesmo host
+        client.download(f"{DS}/file/rebaixa")
+
+    def boom(request):
+        raise httpx.ConnectError("sem rota")
+
+    broken = DocusealClient(DS, "t", http=httpx.Client(transport=httpx.MockTransport(boom)))
+    with pytest.raises(DocusealError):
+        broken.create_submission(template_id=1, email="a@b", name="A", external_id="x", values={})
+    with pytest.raises(DocusealError):
+        broken.download(f"{DS}/file/doc.pdf")
+    assert broken.get_submitter(1) is None
+    broken.archive_submission(1)  # não propaga

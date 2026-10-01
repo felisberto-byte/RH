@@ -167,3 +167,16 @@ def seeded(session):
         )
     session.commit()
     return {"maria": maria, "joao": joao, "holerite": holerite, "informe": informe, "term": term}
+
+
+@pytest.fixture
+def batch_pdf():
+    """PDF único da folha: 2 colaboradores conhecidos (um com 2 páginas) e 1 desconhecido."""
+    return make_pdf(
+        [
+            ["HOLERITE", "Matrícula: 000123", "Maria Silva"],
+            ["(continuação) Maria"],
+            ["HOLERITE", "Matrícula: 000456", "João Souza"],
+            ["HOLERITE", "Matrícula: 999999", "Desconhecido"],
+        ]
+    )

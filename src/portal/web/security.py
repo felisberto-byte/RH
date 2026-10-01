@@ -19,6 +19,7 @@ from portal.db import utcnow
 from portal.models import LoginAttempt, UserSession
 
 LOGIN_CSRF_COOKIE = "portal_login_csrf"
+VERIFY_CSRF_COOKIE = "portal_verify_csrf"
 
 
 def cookie_name(settings: Settings) -> str:

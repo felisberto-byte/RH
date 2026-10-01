@@ -145,6 +145,24 @@ def current_user(request: Request, db: Session = Depends(get_db)) -> CurrentUser
     return CurrentUser(sess, security.identity_from_session(sess), employee)
 
 
+def peek_user(request: Request) -> CurrentUser | None:
+    """Usuário da sessão para páginas de erro (sem revalidar no AD e sem
+    exceções): só serve para manter a navegação; nunca para autorizar."""
+    ctx = app_ctx(request)
+    token = request.cookies.get(security.cookie_name(ctx.settings))
+    if not token:
+        return None
+    try:
+        with ctx.database.sessionmaker() as db:
+            sess = security.load_session(db, token, ctx.settings)
+            if sess is None:
+                return None
+            employee = db.get(Employee, sess.employee_id) if sess.employee_id else None
+            return CurrentUser(sess, security.identity_from_session(sess), employee)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def require_admin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Acesso restrito ao RH.")

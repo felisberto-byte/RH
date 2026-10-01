@@ -17,7 +17,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="PORTAL_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_prefix="PORTAL_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # Erros de validação não ecoam valores (senhas/segredos) nos logs.
+        hide_input_in_errors=True,
     )
 
     # --- Geral ---------------------------------------------------------------
@@ -138,6 +143,10 @@ class Settings(BaseSettings):
                 )
             if self.docuseal_enabled and not self.docuseal_url.startswith("https://"):
                 raise ValueError("PORTAL_DOCUSEAL_URL deve usar https em produção")
+            if not self.database_url.startswith("postgresql"):
+                raise ValueError(
+                    "Em produção use PostgreSQL (PORTAL_DATABASE_URL=postgresql+psycopg://...)"
+                )
         if self.signing_ltv and not (self.tsa_url and self.signing_trust_root_files):
             raise ValueError("signing_ltv exige PORTAL_TSA_URL e PORTAL_SIGNING_TRUST_ROOT_FILES")
         if self.docuseal_enabled and not (

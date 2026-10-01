@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import logging
+import re
 import secrets
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 
 from portal import audit
 from portal.audit import sha256_hex
 from portal.auth.base import AuthError, DirectoryUnavailable
 from portal.locks import account_lock, canonical_account, recent_failures, recent_ip_login_failures
-from portal.models import DocStatus, LoginAttempt
+from portal.models import AuditEvent, DocStatus, Document, LoginAttempt
 from portal.signing.pades import inspect_signatures, load_cert_files
 from portal.web import security
 from portal.web.deps import (
@@ -27,6 +29,7 @@ from portal.web.deps import (
 )
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 
 def _login_page(request: Request, error: str | None = None, status_code: int = 200):
@@ -50,6 +53,30 @@ def home(request: Request):
 
 @router.get("/healthz")
 def healthz():
+    """Vivacidade (processo responde). Não toca em dependências."""
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+def readyz(request: Request, db: Session = Depends(get_db)):
+    """Prontidão: banco acessível e certificado de selo dentro da validade."""
+    ctx = app_ctx(request)
+    problems = []
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001
+        log.exception("readyz: banco indisponível")
+        problems.append("banco")
+    if ctx.sealer is None:
+        problems.append("certificado_nao_configurado")
+    else:
+        try:
+            ctx.sealer.ensure_valid()
+        except Exception:  # noqa: BLE001
+            log.error("readyz: certificado de selo fora da validade")
+            problems.append("certificado_fora_da_validade")
+    if problems:
+        return JSONResponse({"status": "indisponivel", "falhas": problems}, status_code=503)
     return {"status": "ok"}
 
 
@@ -189,10 +216,14 @@ def logout(
 
 
 # ------------------------------------------------------------ verificação
-def _public_view(doc) -> dict:
+MAX_VERIFY_BYTES = 25 * 1024 * 1024
+_CODE_RE = re.compile(r"[A-Za-z0-9-]{4,80}")
+
+
+def _public_view(db: Session, doc: Document) -> dict:
     nome = doc.employee.nome.split()
     masked = f"{nome[0]} {nome[-1][0]}." if len(nome) > 1 else nome[0]
-    return {
+    view = {
         "codigo": doc.verification_code,
         "tipo": doc.document_type.nome,
         "titulo": doc.titulo,
@@ -201,10 +232,19 @@ def _public_view(doc) -> dict:
         "colaborador": masked,
         "emitido_em": doc.created_at,
         "concluido_em": doc.completed_at,
+        "cancelado_em": None,
         "sha256_emitido": doc.sealed_sha256,
         "sha256_final": doc.final_sha256,
         "sha256_comprovante": doc.receipt_sha256,
     }
+    if doc.status == DocStatus.CANCELADO:
+        # Informa que o documento existiu e foi cancelado (sem o motivo, que é interno).
+        view["cancelado_em"] = db.scalar(
+            select(AuditEvent.occurred_at).where(
+                AuditEvent.document_id == doc.id, AuditEvent.action == "DOCUMENTO_CANCELADO"
+            )
+        )
+    return view
 
 
 def _verify_allowed(request: Request, db: Session) -> bool:
@@ -217,14 +257,14 @@ def _verify_allowed(request: Request, db: Session) -> bool:
         return False
 
 
-@router.get("/verificar")
-def verify_form(request: Request, db: Session = Depends(get_db)):
-    if not _verify_allowed(request, db):
-        return RedirectResponse("/login", status_code=303)
+def _verify_page(request: Request, status_code: int = 200, **context):
+    """Sempre exibe os formulários (código e arquivo) com um token novo, em
+    cookie próprio (não interfere no formulário de login aberto em outra aba)."""
     token = secrets.token_urlsafe(24)
-    resp = render(request, "verificar.html", result=None, login_csrf=token)
+    context.setdefault("result", None)
+    resp = render(request, "verificar.html", status_code=status_code, verify_csrf=token, **context)
     resp.set_cookie(
-        security.LOGIN_CSRF_COOKIE,
+        security.VERIFY_CSRF_COOKIE,
         token,
         httponly=True,
         samesite="strict",
@@ -234,49 +274,58 @@ def verify_form(request: Request, db: Session = Depends(get_db)):
     return resp
 
 
+@router.get("/verificar")
+def verify_form(request: Request, codigo: str = "", db: Session = Depends(get_db)):
+    if not _verify_allowed(request, db):
+        return RedirectResponse("/login", status_code=303)
+    codigo = codigo.strip()
+    if codigo:
+        if not _CODE_RE.fullmatch(codigo):
+            return _verify_page(request, 400, error="Código inválido. Confira e tente novamente.")
+        return RedirectResponse(f"/verificar/{codigo.upper()}", status_code=303)
+    return _verify_page(request)
+
+
 @router.get("/verificar/{code}")
 def verify_code(code: str, request: Request, db: Session = Depends(get_db)):
     if not _verify_allowed(request, db):
         return RedirectResponse("/login", status_code=303)
     doc = document_service(request, db).find_by_hash_or_code(code[:80])
-    found = doc is not None and doc.status != DocStatus.CANCELADO
-    return render(
+    return _verify_page(
         request,
-        "verificar.html",
-        result=_public_view(doc) if found else None,
+        200 if doc else 404,
+        result=_public_view(db, doc) if doc else None,
         searched=True,
-        login_csrf="",
-        status_code=200 if found else 404,
+        searched_code=code[:80],
     )
 
 
 @router.post("/verificar")
-async def verify_upload(
+def verify_upload(
     request: Request,
     arquivo: UploadFile = File(...),
-    login_csrf: str = Form(""),
+    verify_csrf: str = Form(""),
     db: Session = Depends(get_db),
 ):
     if not _verify_allowed(request, db):
         return RedirectResponse("/login", status_code=303)
-    if not security.csrf_ok(request.cookies.get(security.LOGIN_CSRF_COOKIE), login_csrf):
-        return RedirectResponse("/verificar", status_code=303)
-    data = await arquivo.read(25 * 1024 * 1024 + 1)
-    if len(data) > 25 * 1024 * 1024:
-        return RedirectResponse("/verificar", status_code=303)
+    if not security.csrf_ok(request.cookies.get(security.VERIFY_CSRF_COOKIE), verify_csrf):
+        return _verify_page(request, 400, error="Formulário expirado. Envie o arquivo novamente.")
+    data = arquivo.file.read(MAX_VERIFY_BYTES + 1)
+    if len(data) > MAX_VERIFY_BYTES:
+        return _verify_page(request, 413, error="Arquivo maior que 25 MB.")
+    if not data:
+        return _verify_page(request, 400, error="Selecione um arquivo PDF.")
     digest = sha256_hex(data)
     doc = document_service(request, db).find_by_hash_or_code(digest)
     found = doc is not None and doc.status != DocStatus.CANCELADO
-    signatures = await run_in_threadpool(_signatures, request, data) if found else []
-    return render(
+    return _verify_page(
         request,
-        "verificar.html",
-        result=_public_view(doc) if found else None,
+        200 if doc else 404,
+        result=_public_view(db, doc) if doc else None,
         searched=True,
         uploaded_hash=digest,
-        signatures=signatures,
-        login_csrf="",
-        status_code=200 if found else 404,
+        signatures=_signatures(request, data) if found else [],
     )
 
 
@@ -288,6 +337,7 @@ def _signatures(request: Request, data: bytes) -> list[dict]:
         roots = load_cert_files(roots_files) if roots_files else []
         infos = inspect_signatures(data, roots)
     except Exception:  # noqa: BLE001 - PDF sem assinatura/ilegível: apenas não exibe
+        log.info("verificação: assinaturas não puderam ser lidas", exc_info=True)
         return []
     return [
         {
