@@ -108,6 +108,9 @@ Depois, pela **Área do RH**:
 - [ ] ACT ICP-Brasil configurada (`tsa_url`) e job `anchor-audit` executando.
 - [ ] Política ICP-Brasil (OID/hash/URI) validada no **Verificador do ITI** com um
       documento de teste.
+- [ ] **Certificado dedicado ao selo** (não o mesmo e-CNPJ usado no e-CAC/eSocial),
+      idealmente importado no Cloud KMS (HSM).
+- [ ] Política PAdES na versão compatível com a raiz da cadeia (v5 → v1.1; v12 → v1.2+).
 - [ ] Cadeia ICP-Brasil completa: o `.pfx` deve conter as ACs intermediárias. Se não
       contiver, empacote os PEM na imagem e use `PORTAL_SIGNING_CA_CHAIN_FILES`.
 - [ ] Teste de restauração do Cloud SQL e do bucket.
@@ -124,12 +127,32 @@ Depois, pela **Área do RH**:
 - **Sem Load Balancer** (ambiente de teste): mude `ingress` para
   `INGRESS_TRAFFIC_ALL`, use a URL `run.app` e `PORTAL_TRUSTED_PROXY_HOPS=1`. Isso
   dispensa o Cloud Armor; não use em produção.
-- **DocuSeal CE**: rode-o em uma VM pequena (e2-small/medium) com Docker Compose,
-  Postgres próprio ou no mesmo Cloud SQL (outro banco), e **nginx na frente** com
-  `real_ip` confiando nas faixas do Google. Sem isso, o DocuSeal registra o IP do
-  balanceador. Configure no DocuSeal o webhook para
-  `https://DOMINIO/webhooks/docuseal` com o segredo HMAC em
-  `PORTAL_DOCUSEAL_WEBHOOK_SECRET`. Não faz parte deste Terraform.
+- **Faixas não RFC 1918 na rede local:** `PRIVATE_RANGES_ONLY` só envia à VPC destinos
+  RFC 1918. Se a rede da empresa usa 100.64/10 ou IPs públicos internamente, use
+  `ALL_TRAFFIC`. Nesse caso a saída para a internet (ACT) passa a exigir Cloud NAT.
+- **HA VPN com um único IP público na empresa:** é possível
+  (`SINGLE_IP_INTERNALLY_REDUNDANT`), com SLA menor, se o roteador suportar BGP.
+- **DocuSeal CE**, se for usado:
+  - **Onde rodar:** VM pequena (e2-small/medium) com Docker Compose. O Sidekiq e o
+    Redis rodam embutidos e exigem CPU sempre ligada. Banco no mesmo Cloud SQL (outro
+    banco e usuário).
+  - **Segredos:** `SECRET_KEY_BASE` e `ENCRYPTION_SECRET` fixados pelo Secret Manager.
+  - **Proxy:** nginx na frente, com `real_ip` confiando nas faixas do Google. Sem isso,
+    o DocuSeal registra o IP do balanceador.
+  - **Assinatura:** use `CERTS={"enabled":false}` para que o DocuSeal não assine com
+    certificado próprio. Assim o selo PAdES ICP-Brasil do portal é a única assinatura,
+    e **o e-CNPJ nunca entra no banco do DocuSeal**.
+  - **Carimbo do tempo:** não configure ACT no DocuSeal. Se a ACT falhar, ele grava um
+    carimbo falso com a hora local, sem erro. O portal carimba.
+  - **Webhook:** `https://DOMINIO/webhooks/docuseal`, com o segredo HMAC em
+    `PORTAL_DOCUSEAL_WEBHOOK_SECRET`.
+  - **Contas:** ative o TOTP para os usuários do RH no DocuSeal (todos são
+    administradores no CE).
+  - **Idioma:** o DocuSeal só tem pt-PT; `pt-BR` gera erro 500.
+  - **Licença:** AGPLv3 com termo 7(b) (manter a atribuição). Modificar o código
+    obriga a oferecer o fonte aos usuários.
+
+  Não faz parte deste Terraform.
 
 ## 7. Evoluções recomendadas
 

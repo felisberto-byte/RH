@@ -32,7 +32,7 @@ DEFAULT_TYPES = [
         "nome": "Recibo de pagamento (holerite)",
         "requires_acceptance": True,
         "declaration_text": (
-            "Declaro que recebi este recibo de pagamento e que tive acesso ao seu conteúdo "
+            "Declaro que recebi este recibo de pagamento e tomei ciência de seu conteúdo "
             "integral, ciente de que poderei contestá-lo junto ao RH."
         ),
         "anchor_text": "Assinatura do Funcionário",

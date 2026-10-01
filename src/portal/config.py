@@ -74,7 +74,8 @@ class Settings(BaseSettings):
     tsa_url: str = ""
     tsa_username: str = ""
     tsa_password: SecretStr = SecretStr("")
-    # Política de assinatura ICP-Brasil (DOC-ICP-15.03), opcional.
+    # Política de assinatura ICP-Brasil (DOC-ICP-15.03), opcional. O hash pode ser
+    # informado em hexadecimal (como na LPA) ou base64. Ver docs/assinatura-e-validade-juridica.md.
     signature_policy_oid: str = ""
     signature_policy_hash_b64: str = ""
     signature_policy_hash_alg: str = "sha256"

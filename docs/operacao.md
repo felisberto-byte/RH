@@ -55,7 +55,9 @@
 1. **Keycloak/OIDC** (ADR 0004): WebAuthn/passkeys e SSO para outras aplicações.
 2. **Visualizador pdf.js empacotado**, para celulares sem leitor de PDF embutido.
 3. **Notificações por e-mail** (Workspace SMTP relay) de novos documentos e de cada
-   aceite. Isso reforça a prova contra alegação de documento unilateral.
+   aceite. Isso reforça a prova contra alegação de documento unilateral. Atenção: contas
+   Cloud Identity Free **não têm caixa de e-mail**, então use o e-mail pessoal
+   cadastrado no RH.
 4. **Acesso de ex-colaboradores** por OTP no e-mail pessoal cadastrado no RH (LGPD
    arts. 18/19).
 5. **Renovação de carimbos de arquivamento** (B-LTA,
@@ -67,3 +69,5 @@
    pelo certificado de homologação.
 8. **Vínculos múltiplos** (uma pessoa com várias matrículas): modelo pessoa(CPF) 1:N
    vínculo(matrícula).
+9. **Buckets por classe documental**, com prazos de retenção distintos: holerites, por
+   exemplo 10 anos, e contratos, por exemplo 30 anos.

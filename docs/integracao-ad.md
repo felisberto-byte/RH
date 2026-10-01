@@ -15,6 +15,10 @@ certificado de servidor para o LDAPS.
   instalar o AD CS no controlador.
 - Importe o certificado com a chave privada no repositório *Computador local → Pessoal*
   (ou *NTDS\Pessoal*). O DC passa a aceitar LDAPS automaticamente.
+- No primeiro certificado, a KB 321051 orienta **reiniciar o DC**. Na renovação, use a
+  operação `renewServerCertificate` do rootDSE ou reinicie. Gere a chave com um
+  provedor compatível com o Schannel. Se usar AC própria (openssl/step-ca), importe o
+  PFX de modo que o Schannel enxergue a chave, e documente o procedimento de renovação.
 - Teste de uma máquina da rede:
   `openssl s_client -connect dc01.empresa.local:636 -showcerts`.
 - Entregue ao time do portal o **certificado da AC** (PEM): ele vai para

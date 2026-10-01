@@ -47,8 +47,6 @@ def test_tampering_breaks_certification(sealer, pki):
 
 
 def test_policy_oid_and_commitment_embedded(pki):
-    import base64
-    import hashlib
     import io
 
     from pyhanko.pdf_utils.reader import PdfFileReader
@@ -62,7 +60,8 @@ def test_policy_oid_and_commitment_embedded(pki):
         PFX_PASSWORD,
         ca_chain_files=[pki["ca"]],
         policy_oid=oid,
-        policy_hash_b64=base64.b64encode(hashlib.sha256(b"lpa").digest()).decode(),
+        # hash em hexadecimal, como publicado na LPA (AD-RB v1.1)
+        policy_hash_b64="95752d26ca974d46675ae7fb787b606a71ea941f26b59f6b6a321f97d63b9cb1",
         policy_uri="http://politicas.icpbrasil.gov.br/PA_PAdES_AD_RB_v1_1.der",
     )
     sealed = sealer.seal_issue(make_pdf(["Holerite"]), placement=None)
@@ -70,6 +69,7 @@ def test_policy_oid_and_commitment_embedded(pki):
     attrs = {a["type"].native: a for a in sig.signer_info["signed_attrs"]}
     pol = attrs["signature_policy_identifier"]["values"][0].chosen
     assert pol["sig_policy_id"].dotted == oid
+    assert pol["sig_policy_hash"]["digest"].native.hex().startswith("95752d26")
     assert "commitment_type" in attrs
     infos = inspect_signatures(sealed, load_cert_files([pki["ca"]]))
     assert infos[0].intact and infos[0].valid

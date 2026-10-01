@@ -54,6 +54,14 @@ FIELD_RECEIPT = "SeloEmpresaComprovante"
 FIELD_FINAL = "SeloEmpresaFinal"
 
 
+def _decode_policy_hash(value: str) -> bytes:
+    """Aceita o hash da política em hexadecimal (como publicado na LPA) ou base64."""
+    v = value.strip()
+    if len(v) in (64, 96, 128) and all(c in "0123456789abcdefABCDEF" for c in v):
+        return bytes.fromhex(v)
+    return base64.b64decode(v)
+
+
 _STAMP_REPLACEMENTS = str.maketrans(
     {"…": "...", "—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "•": "·"}
 )
@@ -146,7 +154,7 @@ class Sealer:
                 "sig_policy_hash": algos.DigestInfo(
                     {
                         "digest_algorithm": {"algorithm": policy_hash_alg},
-                        "digest": base64.b64decode(policy_hash_b64),
+                        "digest": _decode_policy_hash(policy_hash_b64),
                     }
                 ),
             }
