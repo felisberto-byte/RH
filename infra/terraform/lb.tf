@@ -38,6 +38,19 @@ resource "google_compute_security_policy" "portal" {
     description = "Limita tentativas de login, verificação e confirmações por IP"
   }
 
+  # Verificação de disponibilidade do Cloud Monitoring (checadores fora do
+  # Brasil): só GET /readyz, que não expõe dados, passa antes do filtro por país.
+  rule {
+    action   = "allow"
+    priority = 1500
+    match {
+      expr {
+        expression = "request.method == 'GET' && request.path == '/readyz'"
+      }
+    }
+    description = "Uptime check (/readyz)"
+  }
+
   # Regras OWASP pré-configuradas. Comece em modo de avaliação (preview) e
   # observe os logs antes de bloquear (uploads de PDF podem gerar falsos positivos).
   dynamic "rule" {

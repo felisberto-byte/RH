@@ -1,8 +1,7 @@
 """Ponto de entrada ASGI: ``uvicorn portal.web.asgi:app``."""
 
-import logging
-
+from portal.logs import setup_logging
 from portal.web.app import create_app
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+setup_logging()
 app = create_app()

@@ -1,4 +1,15 @@
-resource "random_password" "db" {
+# Dois usuários no banco:
+# - portal_owner: dono do esquema; usado SÓ pelo job de migração.
+# - portal_app: usado pela aplicação; criado via SQL pelo job de migração
+#   (`portal db-app-role`), pois usuários criados pela API do Cloud SQL recebem
+#   o papel cloudsqlsuperuser. Sem ser dono das tabelas, o app não consegue
+#   remover os gatilhos que tornam auditoria/aceites somente-inclusão.
+resource "random_password" "db_owner" {
+  length  = 32
+  special = false
+}
+
+resource "random_password" "db_app" {
   length  = 32
   special = false
 }
@@ -58,8 +69,8 @@ resource "google_sql_database" "portal" {
   instance = google_sql_database_instance.portal.name
 }
 
-resource "google_sql_user" "portal" {
-  name     = "portal"
+resource "google_sql_user" "owner" {
+  name     = "portal_owner"
   instance = google_sql_database_instance.portal.name
-  password = random_password.db.result
+  password = random_password.db_owner.result
 }

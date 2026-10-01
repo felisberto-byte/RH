@@ -8,7 +8,9 @@ services:
       POSTGRES_DB: portal
       POSTGRES_USER: portal
       POSTGRES_PASSWORD: portal-dev
-    volumes: [pgdata:/var/lib/postgresql/data]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/dev/postgres-init.sql:/docker-entrypoint-initdb.d/10-docuseal.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U portal"]
       interval: 5s
@@ -32,14 +34,21 @@ services:
       PORTAL_SIGNING_PFX_FILE: /app/var/dev/dev-ecnpj.pfx
       PORTAL_SIGNING_PFX_PASSWORD: dev
       PORTAL_SIGNING_CA_CHAIN_FILES: '["/app/var/dev/dev-ca.pem"]'
+      PORTAL_SIGNING_TRUST_ROOT_FILES: '["/app/var/dev/dev-ca.pem"]'
+      PORTAL_LOG_FORMAT: text
     volumes: [portalvar:/app/var]
+    # O certificado de TESTE é gerado só na primeira subida: regerá-lo tornaria
+    # "não confiáveis" os documentos já emitidos no ambiente de desenvolvimento.
     command: >
-      sh -c "portal dev-cert /app/var/dev --senha dev >/dev/null 2>&1 || true;
-             alembic upgrade head && portal seed &&
+      sh -c "set -e;
+             [ -f /app/var/dev/dev-ecnpj.pfx ] || portal dev-cert /app/var/dev --senha dev;
+             alembic upgrade head;
+             portal seed;
              exec uvicorn portal.web.asgi:app --host 0.0.0.0 --port 8080"
 
   docuseal:
     profiles: ["docuseal"]
+    # Em produção fixe a versão (tag) validada com o portal.
     image: docuseal/docuseal:latest
     depends_on:
       db: {condition: service_healthy}

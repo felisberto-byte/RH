@@ -2,16 +2,36 @@
 
 Revision ID: 0001
 Revises: 
-Create Date: 2026-10-01 04:19:55.882826
+Create Date: 2026-10-01 05:36:32.159205
 
 """
 from typing import Sequence, Union
 
-from alembic import op
+from alembic import context, op
 import sqlalchemy as sa
 
-
+# Tabelas somente-inclusão: UPDATE/DELETE/TRUNCATE bloqueados no próprio banco.
 APPEND_ONLY = ("auditoria", "aceites", "termos_adesao_aceites", "auditoria_ancoras")
+# Tabelas que o papel da aplicação pode alterar livremente.
+APP_RW = (
+    "colaboradores",
+    "documentos",
+    "lotes",
+    "sessoes",
+    "tentativas_login",
+    "mfa_totp",
+    "tipos_documento",
+)
+GENESIS = "0" * 64
+
+
+def _app_role() -> str:
+    """Papel de banco usado pela aplicação (``alembic -x app_role=...``)."""
+    role = context.get_x_argument(as_dictionary=True).get("app_role", "portal_app")
+    if not role.replace("_", "").isalnum():
+        raise ValueError(f"app_role inválido: {role!r}")
+    return role
+
 
 # revision identifiers, used by Alembic.
 revision: str = '0001'
@@ -112,6 +132,8 @@ def upgrade() -> None:
     sa.Column('docuseal_template_id', sa.Integer(), nullable=True),
     sa.Column('retention_years', sa.Integer(), nullable=False),
     sa.Column('ativo', sa.Boolean(), nullable=False),
+    sa.Column('manifestation_kind', sa.String(length=10), nullable=False),
+    sa.Column('requires_totp', sa.Boolean(), nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('code')
     )
@@ -151,10 +173,14 @@ def upgrade() -> None:
     sa.Column('user_agent', sa.String(length=512), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('last_seen_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('validated_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('revoked', sa.Boolean(), nullable=False),
     sa.ForeignKeyConstraint(['employee_id'], ['colaboradores.id'], ),
     sa.PrimaryKeyConstraint('token_hash')
     )
+    with op.batch_alter_table('sessoes', schema=None) as batch_op:
+        batch_op.create_index(batch_op.f('ix_sessoes_last_seen_at'), ['last_seen_at'], unique=False)
+
     op.create_table('termos_adesao_aceites',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('employee_id', sa.Integer(), nullable=False),
@@ -166,6 +192,10 @@ def upgrade() -> None:
     sa.Column('user_agent', sa.String(length=512), nullable=True),
     sa.Column('registered_by', sa.String(length=128), nullable=False),
     sa.Column('note', sa.Text(), nullable=True),
+    sa.Column('evidence_json', sa.Text(), nullable=True),
+    sa.Column('evidence_sha256', sa.String(length=64), nullable=True),
+    sa.Column('receipt_key', sa.String(length=255), nullable=True),
+    sa.Column('receipt_sha256', sa.String(length=64), nullable=True),
     sa.ForeignKeyConstraint(['employee_id'], ['colaboradores.id'], ),
     sa.ForeignKeyConstraint(['term_id'], ['termos_adesao.id'], ),
     sa.PrimaryKeyConstraint('id'),
@@ -183,6 +213,8 @@ def upgrade() -> None:
     sa.Column('titulo', sa.String(length=200), nullable=False),
     sa.Column('competencia', sa.String(length=7), nullable=True),
     sa.Column('status', sa.Enum('PENDENTE', 'DISPONIVEL', 'ASSINADO', 'RECUSADO', 'CANCELADO', name='docstatus', native_enum=False), nullable=False),
+    sa.Column('declaration_text', sa.Text(), nullable=True),
+    sa.Column('declaration_sha256', sa.String(length=64), nullable=True),
     sa.Column('verification_code', sa.String(length=20), nullable=False),
     sa.Column('original_sha256', sa.String(length=64), nullable=True),
     sa.Column('sealed_sha256', sa.String(length=64), nullable=True),
@@ -203,8 +235,7 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['batch_id'], ['lotes.id'], ),
     sa.ForeignKeyConstraint(['document_type_id'], ['tipos_documento.id'], ),
     sa.ForeignKeyConstraint(['employee_id'], ['colaboradores.id'], ),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('employee_id', 'document_type_id', 'competencia', 'original_sha256')
+    sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('documentos', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_documentos_docuseal_submitter_id'), ['docuseal_submitter_id'], unique=False)
@@ -214,6 +245,7 @@ def upgrade() -> None:
         batch_op.create_index(batch_op.f('ix_documentos_sealed_sha256'), ['sealed_sha256'], unique=False)
         batch_op.create_index(batch_op.f('ix_documentos_status'), ['status'], unique=False)
         batch_op.create_index(batch_op.f('ix_documentos_verification_code'), ['verification_code'], unique=True)
+        batch_op.create_index('uq_documentos_emissao_ativa', ['employee_id', 'document_type_id', sa.literal_column("coalesce(competencia, '')"), 'original_sha256'], unique=True, postgresql_where=sa.text("status <> 'CANCELADO' AND original_sha256 IS NOT NULL"), sqlite_where=sa.text("status <> 'CANCELADO' AND original_sha256 IS NOT NULL"))
 
     op.create_table('aceites',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -241,23 +273,108 @@ def upgrade() -> None:
     )
     # ### end Alembic commands ###
 
-    # Defesa em profundidade (PostgreSQL): trilha de auditoria e aceites são
-    # append-only — UPDATE/DELETE são bloqueados no próprio banco.
-    if op.get_bind().dialect.name == "postgresql":
+    # Cabeça da cadeia de auditoria (linha única; serializa as inclusões).
+    head = sa.table(
+        "auditoria_cabeca",
+        sa.column("id", sa.Integer),
+        sa.column("last_event_id", sa.Integer),
+        sa.column("last_hash", sa.String),
+    )
+    op.bulk_insert(head, [{"id": 1, "last_event_id": 0, "last_hash": GENESIS}])
+    if op.get_bind().dialect.name != "postgresql":
+        return
+    # Defesa em profundidade: mesmo com a credencial da aplicação, trilha de
+    # auditoria, aceites e âncoras não podem ser alterados nem apagados.
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION portal_bloqueia_alteracao() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'tabela % é somente-inclusão (append-only)', TG_TABLE_NAME;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    for table in APPEND_ONLY:
         op.execute(
-            """
-            CREATE OR REPLACE FUNCTION portal_bloqueia_alteracao() RETURNS trigger AS $$
-            BEGIN
-                RAISE EXCEPTION 'tabela % é somente-inclusão (append-only)', TG_TABLE_NAME;
-            END;
-            $$ LANGUAGE plpgsql;
-            """
+            f"CREATE TRIGGER {table}_append_only BEFORE UPDATE OR DELETE ON {table} "
+            "FOR EACH ROW EXECUTE FUNCTION portal_bloqueia_alteracao()"
         )
-        for table in APPEND_ONLY:
-            op.execute(
-                f"CREATE TRIGGER {table}_append_only BEFORE UPDATE OR DELETE ON {table} "
-                f"FOR EACH ROW EXECUTE FUNCTION portal_bloqueia_alteracao()"
-            )
+        op.execute(
+            f"CREATE TRIGGER {table}_sem_truncate BEFORE TRUNCATE ON {table} "
+            "FOR EACH STATEMENT EXECUTE FUNCTION portal_bloqueia_alteracao()"
+        )
+    # Cabeça: só avança (UPDATE); nunca é apagada nem recua.
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION portal_cabeca_so_avanca() RETURNS trigger AS $$
+        BEGIN
+            IF TG_OP <> 'UPDATE' THEN
+                RAISE EXCEPTION 'auditoria_cabeca não pode ser apagada';
+            END IF;
+            IF NEW.id <> OLD.id OR NEW.last_event_id < OLD.last_event_id THEN
+                RAISE EXCEPTION 'auditoria_cabeca só pode avançar';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    op.execute(
+        "CREATE TRIGGER auditoria_cabeca_so_avanca BEFORE UPDATE OR DELETE ON auditoria_cabeca "
+        "FOR EACH ROW EXECUTE FUNCTION portal_cabeca_so_avanca()"
+    )
+    op.execute(
+        "CREATE TRIGGER auditoria_cabeca_sem_truncate BEFORE TRUNCATE ON auditoria_cabeca "
+        "FOR EACH STATEMENT EXECUTE FUNCTION portal_bloqueia_alteracao()"
+    )
+    # Termo publicado é imutável (texto, versão, hash); só "active" pode mudar.
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION portal_termo_imutavel() RETURNS trigger AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                RAISE EXCEPTION 'termo de adesão publicado não pode ser apagado';
+            END IF;
+            IF NEW.id <> OLD.id OR NEW.version <> OLD.version OR NEW.text <> OLD.text
+               OR NEW.sha256 <> OLD.sha256 OR NEW.published_at <> OLD.published_at
+               OR NEW.published_by <> OLD.published_by THEN
+                RAISE EXCEPTION 'termo de adesão publicado é imutável (publique nova versão)';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    op.execute(
+        "CREATE TRIGGER termos_adesao_imutavel BEFORE UPDATE OR DELETE ON termos_adesao "
+        "FOR EACH ROW EXECUTE FUNCTION portal_termo_imutavel()"
+    )
+    op.execute(
+        "CREATE TRIGGER termos_adesao_sem_truncate BEFORE TRUNCATE ON termos_adesao "
+        "FOR EACH STATEMENT EXECUTE FUNCTION portal_bloqueia_alteracao()"
+    )
+    # Privilégios mínimos do papel da aplicação (as migrações rodam com o papel
+    # dono do esquema; a aplicação não consegue remover gatilhos nem tabelas).
+    role = _app_role()
+    tables = {
+        "SELECT, INSERT": APPEND_ONLY,
+        "SELECT, INSERT, UPDATE": ("auditoria_cabeca", "termos_adesao"),
+        "SELECT, INSERT, UPDATE, DELETE": APP_RW,
+    }
+    grants = [f"GRANT USAGE ON SCHEMA public TO {role}"]
+    grants += [f"GRANT {priv} ON {t} TO {role}" for priv, ts in tables.items() for t in ts]
+    grants.append(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}")
+    body = ";\n            ".join(grants)
+    # Nome do papel validado em _app_role() (apenas letras, números e "_").
+    sql = (
+        "DO $$\nBEGIN\n"  # noqa: S608 - papel validado
+        f"  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
+        f"    {body};\n"
+        "  ELSE\n"
+        f"    RAISE NOTICE 'papel {role} inexistente: privilégios não concedidos';\n"
+        "  END IF;\nEND $$;"
+    )
+    op.execute(sql)
 
 
 def downgrade() -> None:
@@ -265,10 +382,20 @@ def downgrade() -> None:
     if op.get_bind().dialect.name == "postgresql":
         for table in APPEND_ONLY:
             op.execute(f"DROP TRIGGER IF EXISTS {table}_append_only ON {table}")
-        op.execute("DROP FUNCTION IF EXISTS portal_bloqueia_alteracao()")
+            op.execute(f"DROP TRIGGER IF EXISTS {table}_sem_truncate ON {table}")
+        for trig, table in (
+            ("auditoria_cabeca_so_avanca", "auditoria_cabeca"),
+            ("auditoria_cabeca_sem_truncate", "auditoria_cabeca"),
+            ("termos_adesao_imutavel", "termos_adesao"),
+            ("termos_adesao_sem_truncate", "termos_adesao"),
+        ):
+            op.execute(f"DROP TRIGGER IF EXISTS {trig} ON {table}")
+        for fn in ("portal_bloqueia_alteracao", "portal_cabeca_so_avanca", "portal_termo_imutavel"):
+            op.execute(f"DROP FUNCTION IF EXISTS {fn}()")
     # ### commands auto generated by Alembic - please adjust! ###
     op.drop_table('aceites')
     with op.batch_alter_table('documentos', schema=None) as batch_op:
+        batch_op.drop_index('uq_documentos_emissao_ativa', postgresql_where=sa.text("status <> 'CANCELADO' AND original_sha256 IS NOT NULL"), sqlite_where=sa.text("status <> 'CANCELADO' AND original_sha256 IS NOT NULL"))
         batch_op.drop_index(batch_op.f('ix_documentos_verification_code'))
         batch_op.drop_index(batch_op.f('ix_documentos_status'))
         batch_op.drop_index(batch_op.f('ix_documentos_sealed_sha256'))
@@ -282,6 +409,9 @@ def downgrade() -> None:
         batch_op.drop_index(batch_op.f('ix_termos_adesao_aceites_employee_id'))
 
     op.drop_table('termos_adesao_aceites')
+    with op.batch_alter_table('sessoes', schema=None) as batch_op:
+        batch_op.drop_index(batch_op.f('ix_sessoes_last_seen_at'))
+
     op.drop_table('sessoes')
     op.drop_table('mfa_totp')
     op.drop_table('lotes')

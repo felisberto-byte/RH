@@ -19,4 +19,14 @@ ldap_group_users_dn = "CN=GG_Portal_Colaboradores,OU=Grupos,DC=empresa,DC=local"
 ldap_group_admin_dn = "CN=GG_Portal_RH,OU=Grupos,DC=empresa,DC=local"
 
 accept_mfa = "totp"
-# tsa_url  = "https://act.exemplo.com.br/tsa"   # ACT ICP-Brasil contratada
+
+# Carimbo do tempo: OBRIGATÓRIO em produção, salvo decisão explícita de operar
+# sem ele (allow_no_tsa = true; a ausência fica registrada em cada evidência).
+tsa_url = "https://act.exemplo.com.br/tsa" # ACT ICP-Brasil contratada
+# allow_no_tsa = false
+# signing_ltv  = true   # PAdES-LTA (exige tsa_url e o segredo icp-raizes-pem)
+
+alert_emails = ["ti@empresa.com.br", "dp@empresa.com.br"]
+
+# Ajustes finos sem alterar o Terraform (apenas variáveis PORTAL_* não secretas):
+# extra_env = { PORTAL_SESSION_IDLE_MINUTES = "20", PORTAL_LOGIN_MAX_FAILURES = "4" }

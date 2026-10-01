@@ -5,13 +5,20 @@
 locals {
   replication_location = var.region
 
-  external_secrets = {
+  external_secrets = merge({
     "ldap-bind-password" = "Senha da conta de serviço somente leitura do AD"
     "ad-ca-pem"          = "Certificado (PEM) da AC que emitiu o certificado LDAPS dos DCs"
     "ecnpj-pfx"          = "e-CNPJ A1 (PKCS#12 binário)"
     "ecnpj-pfx-password" = "Senha do e-CNPJ A1"
     "tsa-password"       = "Senha da ACT (carimbo do tempo), se houver"
-  }
+    "icp-raizes-pem"     = "Certificados raiz/intermediários ICP-Brasil (PEM concatenado, fonte: ITI)"
+    }, var.ecnpj_chain_separate ? {
+    "ecnpj-cadeia-pem" = "Cadeia (PEM) da AC emissora do e-CNPJ, quando não incluída no PFX"
+  } : {})
+
+  # Segredos gerados: os da aplicação e os exclusivos do job de migração.
+  app_secrets     = ["portal-secret-key", "database-url"]
+  migrate_secrets = ["database-url-owner", "db-app-password"]
 }
 
 resource "random_password" "secret_key" {
@@ -20,7 +27,7 @@ resource "random_password" "secret_key" {
 }
 
 resource "google_secret_manager_secret" "generated" {
-  for_each  = toset(["portal-secret-key", "database-url"])
+  for_each  = toset(concat(local.app_secrets, local.migrate_secrets))
   secret_id = "${var.name}-${each.value}"
   replication {
     user_managed {
@@ -41,11 +48,27 @@ resource "google_secret_manager_secret_version" "database_url" {
   secret = google_secret_manager_secret.generated["database-url"].id
   secret_data = format(
     "postgresql+psycopg://%s:%s@%s/%s?sslmode=require",
-    google_sql_user.portal.name,
-    random_password.db.result,
+    "portal_app",
+    random_password.db_app.result,
     google_sql_database_instance.portal.private_ip_address,
     google_sql_database.portal.name,
   )
+}
+
+resource "google_secret_manager_secret_version" "database_url_owner" {
+  secret = google_secret_manager_secret.generated["database-url-owner"].id
+  secret_data = format(
+    "postgresql+psycopg://%s:%s@%s/%s?sslmode=require",
+    google_sql_user.owner.name,
+    random_password.db_owner.result,
+    google_sql_database_instance.portal.private_ip_address,
+    google_sql_database.portal.name,
+  )
+}
+
+resource "google_secret_manager_secret_version" "db_app_password" {
+  secret      = google_secret_manager_secret.generated["db-app-password"].id
+  secret_data = random_password.db_app.result
 }
 
 resource "google_secret_manager_secret" "external" {

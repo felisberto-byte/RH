@@ -3,6 +3,12 @@ resource "google_service_account" "portal" {
   display_name = "Portal do Colaborador (Cloud Run)"
 }
 
+# Conta exclusiva do job de migração: só ela lê a credencial do dono do esquema.
+resource "google_service_account" "migrate" {
+  account_id   = "${var.name}-migrate"
+  display_name = "Portal do Colaborador (migração do banco)"
+}
+
 resource "google_service_account" "scheduler" {
   account_id   = "${var.name}-scheduler"
   display_name = "Portal do Colaborador (Cloud Scheduler)"
@@ -22,10 +28,17 @@ resource "google_storage_bucket_iam_member" "portal_read" {
 }
 
 resource "google_secret_manager_secret_iam_member" "generated" {
-  for_each  = google_secret_manager_secret.generated
-  secret_id = each.value.id
+  for_each  = toset(local.app_secrets)
+  secret_id = google_secret_manager_secret.generated[each.value].id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.portal.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "migrate" {
+  for_each  = toset(local.migrate_secrets)
+  secret_id = google_secret_manager_secret.generated[each.value].id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.migrate.email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "external" {

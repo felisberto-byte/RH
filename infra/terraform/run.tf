@@ -29,7 +29,16 @@ locals {
       # Cliente -> Load Balancer externo -> Cloud Run: X-Forwarded-For chega como
       # "<cliente>, <IP do LB>"; o IP real é o 2º da direita.
       PORTAL_TRUSTED_PROXY_HOPS = "2"
+      PORTAL_ALLOW_NO_TSA       = tostring(var.allow_no_tsa)
+      PORTAL_SIGNING_LTV        = tostring(var.signing_ltv)
+      # Raízes ICP-Brasil: validação na tela /verificar, LTV e conferência das âncoras.
+      PORTAL_SIGNING_TRUST_ROOT_FILES = jsonencode(["/secrets/icp-raizes/icp-raizes.pem"])
+      PORTAL_SIGNING_CA_CHAIN_FILES = jsonencode(
+        var.ecnpj_chain_separate ? ["/secrets/ecnpj-cadeia/ecnpj-cadeia.pem"] : []
+      )
+      PORTAL_LOG_FORMAT = "json"
     },
+    var.extra_env,
   )
 
   secret_env = merge(
@@ -44,10 +53,16 @@ locals {
     },
   )
 
-  secret_files = {
-    ecnpj = { secret = google_secret_manager_secret.external["ecnpj-pfx"].secret_id, path = "ecnpj.pfx" }
-    ad-ca = { secret = google_secret_manager_secret.external["ad-ca-pem"].secret_id, path = "ad-ca.pem" }
-  }
+  secret_files = merge(
+    {
+      ecnpj      = { secret = google_secret_manager_secret.external["ecnpj-pfx"].secret_id, path = "ecnpj.pfx" }
+      ad-ca      = { secret = google_secret_manager_secret.external["ad-ca-pem"].secret_id, path = "ad-ca.pem" }
+      icp-raizes = { secret = google_secret_manager_secret.external["icp-raizes-pem"].secret_id, path = "icp-raizes.pem" }
+    },
+    var.ecnpj_chain_separate ? {
+      ecnpj-cadeia = { secret = google_secret_manager_secret.external["ecnpj-cadeia-pem"].secret_id, path = "ecnpj-cadeia.pem" }
+    } : {},
+  )
 }
 
 resource "google_cloud_run_v2_service" "portal" {
@@ -61,7 +76,7 @@ resource "google_cloud_run_v2_service" "portal" {
 
   template {
     service_account = google_service_account.portal.email
-    timeout         = "300s"
+    timeout         = "${var.web_request_timeout_seconds}s"
 
     scaling {
       min_instance_count = var.min_instances
@@ -99,7 +114,7 @@ resource "google_cloud_run_v2_service" "portal" {
       resources {
         limits = {
           cpu    = "1"
-          memory = "1Gi"
+          memory = var.web_memory
         }
         cpu_idle          = true
         startup_cpu_boost = true

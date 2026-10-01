@@ -7,8 +7,10 @@ Exemplos::
     portal import-employees colaboradores.csv
     portal ingest --tipo HOLERITE --competencia 2026-09 \
         --titulo "Holerite setembro/2026" folha_092026.pdf
-    portal verify-audit                 # confere a cadeia de hashes da auditoria
+    portal verify-audit                 # cadeia de hashes completa + âncoras (diário)
     portal anchor-audit                 # carimba (RFC 3161) a cabeça da cadeia — diário
+    portal purge --dias 180             # expurga tentativas de login/sessões antigas (LGPD)
+    portal db-app-role                  # (job de migração) cria o papel de banco do app
     portal cert-info                    # validade do e-CNPJ (renovação anual do A1)
     portal dev-cert var/dev             # gera certificado de TESTE autoassinado
     portal demo                         # (dev) colaboradores + lote de holerites de exemplo
@@ -17,14 +19,18 @@ Exemplos::
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 
 from portal.config import get_settings
 from portal.db import Database
+from portal.logs import setup_logging
+
+log = logging.getLogger("portal.cli")
 
 DEFAULT_TYPES = [
     {
@@ -36,6 +42,7 @@ DEFAULT_TYPES = [
             "integral, ciente de que poderei contestá-lo junto ao RH."
         ),
         "anchor_text": "Assinatura do Funcionário",
+        "manifestation_kind": "ciencia",
         "retention_years": 10,
     },
     {
@@ -47,6 +54,8 @@ DEFAULT_TYPES = [
             "eletrônica tem o mesmo valor da via física."
         ),
         "anchor_text": "Assinatura do Empregado",
+        "manifestation_kind": "aceite",
+        "requires_totp": False,  # recomendado True após todos configurarem o autenticador
         "retention_years": 30,
     },
     {
@@ -55,6 +64,8 @@ DEFAULT_TYPES = [
         "requires_acceptance": True,
         "declaration_text": "Li integralmente e concordo com os termos deste aditivo contratual.",
         "anchor_text": "Assinatura do Empregado",
+        "manifestation_kind": "aceite",
+        "requires_totp": False,
         "retention_years": 30,
     },
     {
@@ -63,6 +74,7 @@ DEFAULT_TYPES = [
         "requires_acceptance": False,
         "declaration_text": "Documento informativo.",
         "anchor_text": None,
+        "manifestation_kind": "ciencia",
         "retention_years": 10,
     },
 ]
@@ -172,15 +184,114 @@ def cmd_ingest(args) -> int:
 
 
 def cmd_verify_audit(_args) -> int:
-    from portal.audit import verify_chain
+    """Verificação COMPLETA: cadeia inteira + cada âncora (evento ancorado
+    inalterado, token íntegro e imprint = hash carimbado)."""
+    from portal.audit import verify_anchors, verify_chain
+    from portal.signing.pades import load_cert_files
+    from portal.storage import build_storage
 
-    with _db().sessionmaker() as s:
-        rep = verify_chain(s)
+    s = get_settings()
+    roots = load_cert_files(s.signing_trust_root_files) if s.signing_trust_root_files else None
+    with _db().sessionmaker() as db:
+        rep = verify_chain(db)
+        verify_anchors(db, build_storage(s), trust_roots=roots, report=rep)
     if rep.ok:
-        print(f"OK: {rep.checked} eventos; hash atual {rep.head_hash}")
+        log.info(
+            "auditoria íntegra: %s eventos, %s âncora(s) conferida(s), última ancorada #%s, cabeça %s",
+            rep.checked,
+            rep.anchors_checked,
+            rep.last_anchored_event_id,
+            rep.head_hash,
+        )
         return 0
-    print(f"FALHA no evento {rep.first_bad_id}: {rep.reason}", file=sys.stderr)
+    log.error(
+        "CADEIA DE AUDITORIA COM FALHA: evento=%s motivo=%s ancoras=%s",
+        rep.first_bad_id,
+        rep.reason,
+        "; ".join(rep.anchor_problems) or "ok",
+    )
     return 1
+
+
+def cmd_db_app_role(args) -> int:
+    """Cria/atualiza o papel de LOGIN da aplicação via SQL (executado pelo dono
+    do esquema, no job de migração). Lê apenas PORTAL_DATABASE_URL e
+    PORTAL_DB_APP_PASSWORD; os privilégios nas tabelas vêm da migração."""
+    import os
+    import re
+
+    from sqlalchemy import create_engine, text
+
+    role = args.papel
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", role):
+        log.error("nome de papel inválido: %s", role)
+        return 2
+    url = os.environ.get("PORTAL_DATABASE_URL", "")
+    password = os.environ.get("PORTAL_DB_APP_PASSWORD", "")
+    if not url.startswith("postgresql") or len(password) < 16:
+        log.error("defina PORTAL_DATABASE_URL (PostgreSQL, dono) e PORTAL_DB_APP_PASSWORD (>= 16)")
+        return 2
+    engine = create_engine(url)
+    with engine.begin() as c:
+        exists = c.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).scalar()
+        verb = "ALTER" if exists else "CREATE"
+        # format(%I, %L) no servidor: identificador e senha corretamente citados.
+        stmt = c.execute(
+            text("SELECT format(CAST(:tpl AS text), CAST(:r AS text), CAST(:p AS text))"),
+            {
+                "tpl": f"{verb} ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %L",
+                "r": role,
+                "p": password,
+            },
+        ).scalar()
+        c.exec_driver_sql(str(stmt))
+        grant = c.execute(
+            text(
+                "SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), "
+                "CAST(:r AS text))"
+            ),
+            {"r": role},
+        ).scalar()
+        c.exec_driver_sql(str(grant))
+    engine.dispose()
+    log.info("papel %s %s", role, "atualizado" if exists else "criado")
+    return 0
+
+
+def cmd_purge(args) -> int:
+    """Minimização (LGPD): apaga tentativas de login e sessões encerradas mais
+    antigas que ``--dias``. Documentos, aceites e auditoria NÃO são tocados
+    (retenção legal; bucket com política de retenção)."""
+    from sqlalchemy import delete, or_
+
+    from portal import audit
+    from portal.db import utcnow
+    from portal.models import LoginAttempt, UserSession
+
+    if args.dias < 30:
+        log.error("--dias deve ser >= 30 (as tentativas recentes sustentam o bloqueio por conta)")
+        return 2
+    cutoff = utcnow() - timedelta(days=args.dias)
+    s = get_settings()
+    with _db().sessionmaker() as db:
+        attempts = db.execute(delete(LoginAttempt).where(LoginAttempt.at < cutoff)).rowcount  # type: ignore[attr-defined]
+        idle_cut = utcnow() - timedelta(hours=s.session_absolute_hours)
+        sessions = db.execute(
+            delete(UserSession).where(
+                or_(UserSession.revoked.is_(True), UserSession.created_at < idle_cut),
+                UserSession.last_seen_at < cutoff,
+            )
+        ).rowcount  # type: ignore[attr-defined]
+        audit.record(
+            db,
+            action="DADOS_OPERACIONAIS_EXPURGADOS",
+            actor_type="sistema",
+            actor_ref="purge",
+            data={"dias": args.dias, "tentativas_login": attempts, "sessoes": sessions},
+        )
+        db.commit()
+    log.info("expurgo: %s tentativa(s) de login e %s sessão(ões) removidas", attempts, sessions)
+    return 0
 
 
 def cmd_anchor_audit(_args) -> int:
@@ -197,7 +308,7 @@ def cmd_anchor_audit(_args) -> int:
     ts = timestamps.HTTPTimeStamper(s.tsa_url, auth=auth, timeout=20)
     with _db().sessionmaker() as db:
         a = anchor_audit(db, build_storage(s), ts, s.tsa_url)
-    print(f"Ancorado evento {a.head_event_id} ({a.head_hash}); token {a.token_key}")
+    log.info("auditoria ancorada: evento %s (%s); token %s", a.head_event_id, a.head_hash, a.token_key)
     return 0
 
 
@@ -211,7 +322,10 @@ def cmd_cert_info(args) -> int:
     exp = sealer.not_valid_after()
     days = (exp - datetime.now(UTC)).days
     print(f"Titular: {sealer.subject}\nVálido até: {exp:%d/%m/%Y %H:%M} UTC ({days} dias)")
-    return 1 if days < args.alerta_dias else 0
+    if days < args.alerta_dias:
+        log.error("CERTIFICADO e-CNPJ vence em %s dia(s) (%s): renove já", days, f"{exp:%d/%m/%Y}")
+        return 1
+    return 0
 
 
 def sample_payslips(people: list[tuple[str, str]], competencia: str) -> bytes:
@@ -364,6 +478,12 @@ def main(argv: list[str] | None = None) -> int:
     ing.set_defaults(fn=cmd_ingest)
     sub.add_parser("verify-audit").set_defaults(fn=cmd_verify_audit)
     sub.add_parser("anchor-audit").set_defaults(fn=cmd_anchor_audit)
+    dr = sub.add_parser("db-app-role")
+    dr.add_argument("--papel", default="portal_app")
+    dr.set_defaults(fn=cmd_db_app_role)
+    pg = sub.add_parser("purge")
+    pg.add_argument("--dias", type=int, default=180)
+    pg.set_defaults(fn=cmd_purge)
     ci = sub.add_parser("cert-info")
     ci.add_argument("--alerta-dias", type=int, default=45)
     ci.set_defaults(fn=cmd_cert_info)
@@ -375,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     dc.add_argument("--senha", default="dev")
     dc.set_defaults(fn=cmd_dev_cert)
     args = p.parse_args(argv)
+    setup_logging()
     return args.fn(args)
 
 

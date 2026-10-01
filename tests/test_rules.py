@@ -230,3 +230,23 @@ def test_session_revoked_when_account_leaves_directory(app, session):
     session.expire_all()
     ev = session.query(AuditEvent).filter_by(action="SESSAO_REVOGADA").one()
     assert "AD" in json.dumps(ev.data, ensure_ascii=False)
+
+
+# ------------------------------------------------------------ .env.example
+def test_env_example_documents_every_setting_and_loads():
+    from pathlib import Path
+
+    from dotenv import dotenv_values
+
+    path = Path(__file__).resolve().parents[1] / ".env.example"
+    text_ = path.read_text(encoding="utf-8")
+    for name in Settings.model_fields:
+        var = f"PORTAL_{name.upper()}"
+        assert re.search(rf"^(# )?{var}=", text_, re.M), f"{var} ausente do .env.example"
+    for line in text_.splitlines():  # sem comentário no fim da linha
+        if line and not line.startswith("#"):
+            assert " #" not in line, line
+    values = dotenv_values(path)
+    assert values["PORTAL_ENV"] == "dev"
+    s = Settings(_env_file=str(path))
+    assert s.env == "dev" and s.auth_provider == "dev"

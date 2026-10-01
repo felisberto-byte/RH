@@ -120,6 +120,46 @@ variable "tsa_username" {
   default = ""
 }
 
+variable "allow_no_tsa" {
+  description = "Permite operar SEM carimbo do tempo (consta na evidência). Prefira configurar tsa_url."
+  type        = bool
+  default     = false
+}
+
+variable "signing_ltv" {
+  description = "Embute dados de validação (LTV/PAdES-LTA). Exige tsa_url e o segredo icp-raizes-pem."
+  type        = bool
+  default     = false
+}
+
+variable "ecnpj_chain_separate" {
+  description = "true se a cadeia do e-CNPJ NÃO estiver dentro do PFX (carregue o segredo ecnpj-cadeia-pem)."
+  type        = bool
+  default     = false
+}
+
+variable "extra_env" {
+  description = "Variáveis PORTAL_* adicionais (não secretas), ex.: PORTAL_SESSION_IDLE_MINUTES."
+  type        = map(string)
+  default     = {}
+  validation {
+    condition     = alltrue([for k in keys(var.extra_env) : startswith(k, "PORTAL_")])
+    error_message = "Use apenas variáveis com prefixo PORTAL_."
+  }
+}
+
+variable "web_memory" {
+  description = "Memória do serviço web (selagem de lotes grandes usa bastante memória)."
+  type        = string
+  default     = "2Gi"
+}
+
+variable "web_request_timeout_seconds" {
+  description = "Tempo máximo de uma requisição (importação de lote é síncrona)."
+  type        = number
+  default     = 900
+}
+
 variable "signature_policy_oid" {
   description = "OID da política ICP-Brasil (DOC-ICP-15.03). Vazio = sem política."
   type        = string
@@ -205,4 +245,10 @@ variable "max_instances" {
 variable "deletion_protection" {
   type    = bool
   default = true
+}
+
+variable "alert_emails" {
+  description = "E-mails que recebem alertas (integridade, cadeia de auditoria, e-CNPJ, jobs, indisponibilidade)."
+  type        = list(string)
+  default     = []
 }

@@ -35,30 +35,15 @@ jobs:
           mypy src
       - name: Testes (SQLite)
         run: pytest
-      - name: Migrações no PostgreSQL (upgrade/downgrade + gatilhos append-only)
+      - name: Migrações no PostgreSQL (CLI upgrade/check/downgrade)
         env:
           PORTAL_ENV: test
           PORTAL_DATABASE_URL: postgresql+psycopg://portal:portal@localhost:5432/portal
         run: |
           alembic upgrade head
           alembic check
-          python - <<'PY'
-          from sqlalchemy import create_engine, text
-          e = create_engine("postgresql+psycopg://portal:portal@localhost:5432/portal")
-          with e.begin() as c:
-              c.execute(text("INSERT INTO auditoria_cabeca (id, last_event_id, last_hash) VALUES (1, 0, repeat('0', 64))"))
-              c.execute(text("""INSERT INTO auditoria (occurred_at, actor_type, actor_ref, action, data, prev_hash, hash)
-                                VALUES (now(), 'sistema', 'ci', 'TESTE', '{}', repeat('0', 64), repeat('a', 64))"""))
-          try:
-              with e.begin() as c:
-                  c.execute(text("DELETE FROM auditoria"))
-              raise SystemExit("gatilho append-only não bloqueou DELETE")
-          except Exception as exc:
-              assert "append-only" in str(exc), exc
-              print("OK: auditoria é append-only")
-          PY
           alembic downgrade base
-      - name: Testes (PostgreSQL)
+      - name: Testes (PostgreSQL; inclui gatilhos e privilégios da migração)
         env:
           PORTAL_TEST_DATABASE_URL: postgresql+psycopg://portal:portal@localhost:5432/portal
         run: pytest
