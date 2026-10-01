@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from portal import audit
 from portal.auth.base import AuthProvider, Identity
 from portal.config import Settings
 from portal.db import Database
@@ -21,8 +22,8 @@ from portal.storage import Storage
 from portal.web import security
 
 MESSAGES = {
-    "aceito": "Aceite registrado com sucesso. O comprovante está disponível para download.",
-    "recusado": "Divergência registrada. O RH foi informado.",
+    "manifestado": "Registro efetuado com sucesso. O comprovante está disponível para download.",
+    "recusado": "Divergência registrada. O RH verá sua contestação no painel de acompanhamento.",
     "saiu": "Você saiu do portal.",
     "expirou": "Sua sessão expirou. Entre novamente.",
     "cancelado": "Documento cancelado.",
@@ -67,13 +68,80 @@ class CurrentUser:
         return self.session.is_admin
 
 
+def _norm_matricula(value: str | None) -> str:
+    if not value or not value.strip():
+        return ""
+    return value.strip().lstrip("0") or "0"
+
+
+def link_problem(employee: Employee, identity: Identity) -> tuple[str, str] | None:
+    """Confere o vínculo conta AD <-> cadastro. Retorna (evento, mensagem) se houver
+    problema: outra conta já vinculada, ou matrícula do AD diferente do cadastro
+    (conta renomeada/reutilizada)."""
+    if employee.ad_object_guid and employee.ad_object_guid != identity.object_guid:
+        return (
+            "VINCULO_AD_CONFLITO",
+            "Seu cadastro está vinculado a outro usuário. Procure o RH.",
+        )
+    if _norm_matricula(identity.employee_id) != _norm_matricula(employee.matricula):
+        return (
+            "VINCULO_AD_DIVERGENTE",
+            "Sua conta do AD não corresponde ao cadastro vinculado. Procure o RH/TI.",
+        )
+    return None
+
+
+def _revalidate(db: Session, ctx: AppContext, sess: UserSession) -> bool:
+    """Revalida no AD (habilitada, grupos, vínculo) a cada N minutos. False = encerrar."""
+    from datetime import timedelta
+
+    from portal.auth.base import DirectoryUnavailable
+    from portal.db import utcnow
+
+    now = utcnow()
+    if now - sess.validated_at < timedelta(minutes=ctx.settings.session_revalidate_minutes):
+        return True
+    identity = security.identity_from_session(sess)
+    try:
+        fresh = ctx.auth.refresh(identity)
+    except DirectoryUnavailable:
+        return True  # indisponibilidade não derruba sessões; tenta na próxima
+    reason = None
+    if fresh is None:
+        reason = "conta desabilitada/fora do grupo no AD"
+    elif sess.employee_id is not None:
+        emp = db.get(Employee, sess.employee_id)
+        if emp is None or not emp.ativo:
+            reason = "cadastro inativo"
+        elif link_problem(emp, fresh):
+            reason = "vínculo AD divergente"
+    if reason:
+        sess.revoked = True
+        audit.record(
+            db,
+            action="SESSAO_REVOGADA",
+            actor_type="sistema",
+            actor_ref=sess.username,
+            data={"motivo": reason},
+        )
+        db.commit()
+        return False
+    assert fresh is not None
+    sess.is_admin = fresh.is_admin
+    sess.validated_at = now
+    db.commit()
+    return True
+
+
 def current_user(request: Request, db: Session = Depends(get_db)) -> CurrentUser:
     ctx = app_ctx(request)
     token = request.cookies.get(security.cookie_name(ctx.settings))
     sess = security.load_session(db, token, ctx.settings)
-    if sess is None:
+    if sess is None or not _revalidate(db, ctx, sess):
         raise LoginRequired()
     employee = db.get(Employee, sess.employee_id) if sess.employee_id else None
+    if employee is not None and not employee.ativo:
+        raise LoginRequired()
     return CurrentUser(sess, security.identity_from_session(sess), employee)
 
 
@@ -122,6 +190,14 @@ def find_employee_for(db: Session, identity: Identity) -> Employee | None:
         return None
     key = identity.employee_id.strip().lstrip("0") or "0"
     return db.scalar(select(Employee).where(func.ltrim(Employee.matricula, "0") == key))
+
+
+def safe_next(value: str | None) -> str:
+    """Só aceita caminhos relativos do próprio portal (evita open redirect)."""
+    v = (value or "").strip()
+    if not v.startswith("/") or v.startswith("//") or "\\" in v or "\n" in v or "\r" in v:
+        return ""
+    return v[:200]
 
 
 def render(request: Request, name: str, status_code: int = 200, **context: Any):

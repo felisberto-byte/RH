@@ -4,6 +4,9 @@
 <h1>Importar lote de documentos</h1>
 {% include "admin/_nav.html" %}
 {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+{% if not types %}
+<div class="alert error" role="alert">Nenhum tipo de documento nativo ativo. Cadastre um em <a href="/rh/tipos">Tipos</a> antes de importar.</div>
+{% endif %}
 <section class="card">
   <form method="post" action="/rh/lotes/novo" enctype="multipart/form-data">
     <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
@@ -15,7 +18,7 @@
       <div><label for="competencia">Competência</label>
         <input id="competencia" name="competencia" type="month"></div>
       <div><label for="titulo">Título exibido ao colaborador</label>
-        <input id="titulo" name="titulo" required placeholder="ex.: Holerite setembro/2026"></div>
+        <input id="titulo" name="titulo" maxlength="200" placeholder="ex.: Holerite setembro/2026 (padrão: nome do tipo)"></div>
     </div>
     <label for="arquivo">Arquivo do sistema de folha (PDF único com todos, ou ZIP com um PDF por colaborador)</label>
     <input id="arquivo" name="arquivo" type="file" accept=".pdf,.zip,application/pdf,application/zip" required>

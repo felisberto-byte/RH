@@ -46,6 +46,7 @@ class ReceiptData:
     evidence_sha256: str
     verification_url: str
     legal_note: str
+    declaration_label: str = "Declaração aceita pelo colaborador"
 
 
 def build_receipt_pdf(data: ReceiptData, evidence_json: str, document_pdf: bytes | None = None) -> bytes:
@@ -97,7 +98,7 @@ def build_receipt_pdf(data: ReceiptData, evidence_json: str, document_pdf: bytes
     story += [
         table,
         Spacer(1, 5 * mm),
-        p("Declaração aceita pelo colaborador", label),
+        p(data.declaration_label, label),
         p(data.declaration),
         Spacer(1, 5 * mm),
         p("SHA-256 da evidência (evidencia.json, anexo a este PDF)", label),

@@ -102,14 +102,24 @@ class TermService:
         term: AdhesionTerm,
         *,
         channel: str,
+        actor_type: str,
         registered_by: str,
         object_guid: str | None = None,
         ip: str | None = None,
         user_agent: str | None = None,
         note: str | None = None,
+        evidence_json: str | None = None,
+        receipt: tuple[str, str] | None = None,
     ) -> AdhesionAcceptance:
+        """Registra a adesão. ``channel="portal"`` só pode vir do próprio
+        colaborador autenticado (``actor_type="colaborador"``); o RH registra
+        apenas adesões coletadas fora (papel/gov.br)."""
         if channel not in ("portal", "papel", "govbr"):
             raise ValueError("canal inválido")
+        if channel == "portal" and actor_type != "colaborador":
+            raise ValueError("adesão pelo portal só pode ser feita pelo próprio colaborador")
+        if channel != "portal" and actor_type != "rh":
+            raise ValueError("adesão externa deve ser registrada pelo RH")
         if self.acceptance_of(employee.id, term) is not None:
             raise ValueError("Termo já aceito.")
         acc = AdhesionAcceptance(
@@ -121,13 +131,17 @@ class TermService:
             user_agent=(user_agent or "")[:512] or None,
             registered_by=registered_by,
             note=note,
+            evidence_json=evidence_json,
+            evidence_sha256=audit.sha256_hex(evidence_json) if evidence_json else None,
+            receipt_key=receipt[0] if receipt else None,
+            receipt_sha256=receipt[1] if receipt else None,
         )
         self.db.add(acc)
         self.db.flush()
         audit.record(
             self.db,
             action="TERMO_ACEITO",
-            actor_type="colaborador" if channel == "portal" else "rh",
+            actor_type=actor_type,
             actor_ref=registered_by,
             ip=ip,
             user_agent=user_agent,
@@ -138,6 +152,7 @@ class TermService:
                 "canal": channel,
                 "objectGUID": object_guid,
                 "observacao": note,
+                "evidencia_sha256": acc.evidence_sha256,
             },
         )
         return acc

@@ -16,20 +16,23 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+import regex
 from pypdf import PdfReader, PdfWriter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from portal import audit
 from portal.audit import sha256_hex
-from portal.documents.service import DocumentError, DocumentService, validate_pdf
+from portal.documents.service import MAX_PDF_BYTES, DocumentError, DocumentService, validate_pdf
 from portal.models import Batch, DocumentType, Employee
 
 DEFAULT_PATTERN = r"Matr[íi]cula\s*[:nº°.]*\s*(\d{1,12})"
 MAX_ZIP_ENTRIES = 5000
-MAX_ZIP_TOTAL = 500 * 1024 * 1024
+MAX_ZIP_TOTAL = 300 * 1024 * 1024
+REGEX_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass
@@ -60,14 +63,33 @@ def normalize_key(raw: str, key_field: str) -> str:
     return digits.lstrip("0") or "0"
 
 
+def compile_pattern(pattern: str):
+    """Valida a expressão informada pelo RH: tamanho, exatamente um grupo de
+    captura e execução com limite de tempo (evita travar o servidor — ReDoS)."""
+    if not pattern or len(pattern) > 200:
+        raise DocumentError("Expressão regular vazia ou longa demais (máx. 200 caracteres).")
+    try:
+        rx = regex.compile(pattern, regex.IGNORECASE)
+    except regex.error as exc:
+        raise DocumentError(f"Expressão regular inválida: {exc}") from exc
+    if rx.groups != 1:
+        raise DocumentError("A expressão regular deve ter exatamente um grupo de captura (...).")
+    return rx
+
+
 def split_by_employee(pdf: bytes, pattern: str = DEFAULT_PATTERN) -> tuple[list[Group], list[int]]:
-    rx = re.compile(pattern, re.IGNORECASE)
+    rx = compile_pattern(pattern)
     reader = PdfReader(io.BytesIO(pdf))
     groups: list[Group] = []
     unmatched: list[int] = []
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ""
-        m = rx.search(text)
+        try:
+            m = rx.search(text, timeout=REGEX_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            raise DocumentError(
+                f"A expressão regular demorou demais na página {i + 1}; simplifique o padrão."
+            ) from exc
         if m:
             key = m.group(1)
             if groups and groups[-1].key == key:
@@ -91,22 +113,25 @@ def extract_pages(pdf: bytes, pages: list[int]) -> bytes:
     return out.getvalue()
 
 
-def iter_zip(data: bytes) -> list[tuple[str, bytes]]:
-    items = []
-    total = 0
+def iter_zip(data: bytes) -> Iterator[tuple[str, bytes]]:
+    """Itera os PDFs do ZIP UM POR VEZ (não mantém todos em memória)."""
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         infos = [i for i in zf.infolist() if not i.is_dir()]
         if len(infos) > MAX_ZIP_ENTRIES:
             raise DocumentError("ZIP com arquivos demais.")
+        if sum(i.file_size for i in infos) > MAX_ZIP_TOTAL:
+            raise DocumentError("ZIP descompactado excede o limite.")
         for info in infos:
             name = info.filename.rsplit("/", 1)[-1]
             if not name.lower().endswith(".pdf") or name.startswith("."):
                 continue
-            total += info.file_size
-            if total > MAX_ZIP_TOTAL:
-                raise DocumentError("ZIP descompactado excede o limite de 500 MB.")
-            items.append((name, zf.read(info)))
-    return items
+            if info.file_size > MAX_PDF_BYTES:
+                raise DocumentError(f"{name}: PDF maior que 20 MB.")
+            with zf.open(info) as fh:
+                payload = fh.read(MAX_PDF_BYTES + 1)
+            if len(payload) > MAX_PDF_BYTES:  # tamanho declarado no ZIP era falso
+                raise DocumentError(f"{name}: PDF maior que 20 MB.")
+            yield name, payload
 
 
 class BatchImporter:
@@ -132,10 +157,18 @@ class BatchImporter:
         key_field: str = "matricula",
         pattern: str = DEFAULT_PATTERN,
     ) -> tuple[Batch, IngestReport]:
+        """Importa um lote. Cada documento é selado FORA de transação (a ACT pode
+        demorar) e gravado em transação curta própria: a trava global da trilha
+        de auditoria nunca fica presa durante o lote, e uma falha isolada não
+        desfaz os documentos já publicados."""
         if competencia and not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", competencia):
             raise DocumentError("Competência deve estar no formato AAAA-MM.")
         if key_field not in ("matricula", "cpf"):
             raise DocumentError("Chave de identificação inválida.")
+        compile_pattern(pattern)
+        is_zip = data[:4] == b"PK\x03\x04"
+        if not is_zip:
+            validate_pdf(data, max_bytes=None)
         report = IngestReport()
         batch = Batch(
             created_by=created_by,
@@ -143,50 +176,61 @@ class BatchImporter:
             source_sha256=sha256_hex(data),
             document_type_id=doc_type.id,
             competencia=competencia,
+            report={"situacao": "em processamento"},
         )
         self.db.add(batch)
-        self.db.flush()
+        self.db.commit()
         index = self._employee_index(key_field)
+        self.db.commit()  # encerra a transação de leitura
 
-        if data[:4] == b"PK\x03\x04":
-            parts = []
-            for name, pdf in iter_zip(data):
-                m = re.match(r"^(\d{1,14})[_\-. ]", name)
-                if not m:
-                    report.errors.append({"arquivo": name, "erro": "nome sem matrícula/CPF"})
+        def parts() -> Iterator[tuple[str, bytes, str]]:
+            if is_zip:
+                for name, pdf in iter_zip(data):
+                    m = re.match(r"^(\d{1,14})[_\-. ]", name)
+                    if not m:
+                        report.errors.append({"arquivo": name, "erro": "nome sem matrícula/CPF"})
+                        continue
+                    yield m.group(1), pdf, name
+            else:
+                groups, report.unmatched_pages = split_by_employee(data, pattern)
+                for g in groups:
+                    yield (
+                        g.key,
+                        extract_pages(data, g.pages),
+                        f"páginas {g.pages[0] + 1}-{g.pages[-1] + 1}",
+                    )
+
+        try:
+            for raw_key, pdf, origin in parts():
+                emp = index.get(normalize_key(raw_key, key_field))
+                if emp is None:
+                    report.errors.append(
+                        {"origem": origin, "chave": raw_key, "erro": "colaborador não cadastrado/ativo"}
+                    )
                     continue
-                parts.append((m.group(1), pdf, name))
-        else:
-            validate_pdf(data)
-            groups, report.unmatched_pages = split_by_employee(data, pattern)
-            parts = [
-                (g.key, extract_pages(data, g.pages), f"páginas {g.pages[0] + 1}-{g.pages[-1] + 1}")
-                for g in groups
-            ]
-
-        for raw_key, pdf, origin in parts:
-            emp = index.get(normalize_key(raw_key, key_field))
-            if emp is None:
-                report.errors.append(
-                    {"origem": origin, "chave": raw_key, "erro": "colaborador não cadastrado/ativo"}
-                )
-                continue
-            try:
-                with self.db.begin_nested():
-                    doc = self.svc.issue(
+                try:
+                    prepared = self.svc.prepare_issue(
                         employee=emp,
                         doc_type=doc_type,
                         pdf=pdf,
                         titulo=titulo,
                         competencia=competencia,
-                        created_by=created_by,
-                        batch=batch,
                     )
-            except DocumentError as exc:
-                report.errors.append({"origem": origin, "chave": raw_key, "erro": str(exc)})
-                continue
-            report.created.append({"documento": doc.id, "matricula": emp.matricula, "origem": origin})
+                    self.db.commit()  # fim da leitura (checagem de duplicidade)
+                    doc = self.svc.persist_issue(prepared, created_by=created_by, batch=batch)
+                    self.db.commit()
+                except DocumentError as exc:
+                    self.db.rollback()
+                    report.errors.append({"origem": origin, "chave": raw_key, "erro": str(exc)})
+                    continue
+                report.created.append(
+                    {"documento": doc.id, "matricula": emp.matricula, "origem": origin}
+                )
+        except DocumentError as exc:  # erro do arquivo como um todo (ZIP, regex...)
+            self.db.rollback()
+            report.errors.append({"origem": filename, "erro": str(exc)})
 
+        batch = self.db.get(Batch, batch.id) or batch
         batch.total_documents = len(report.created)
         batch.report = report.as_dict()
         audit.record(

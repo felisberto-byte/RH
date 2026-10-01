@@ -79,3 +79,91 @@ def test_stamp_text_is_latin1_safe():
     from portal.signing.pades import winansi_safe
 
     assert winansi_safe("Ação · matrícula — SHA… Ştefan ✓") == "Ação · matrícula - SHA... Stefan ?"
+
+
+def _pdf_with_text_field() -> bytes:
+    import io
+
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.drawString(60, 800, "Holerite com campo editável")
+    c.acroForm.textfield(name="salario", value="1000,00", x=60, y=700, width=120, height=20)
+    c.save()
+    return buf.getvalue()
+
+
+def test_pdf_with_editable_fields_is_rejected(sealer):
+    import pytest
+
+    from portal.signing.pades import SealingError
+
+    with pytest.raises(SealingError, match="formulário editáveis"):
+        sealer.seal_issue(_pdf_with_text_field(), placement=None)
+
+
+def test_after_acceptance_document_is_locked(sealer, pki):
+    """O campo de aceite trava o documento: uma assinatura/alteração posterior
+    deixa de ser 'permitida' para as assinaturas anteriores."""
+    import io
+
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.sign import fields
+
+    pdf = make_pdf(["Contrato"])
+    p = resolve_placement(
+        pdf, anchor_text="Assinatura do Colaborador", anchor_page=-1, anchor_box=[300, 40, 560, 110]
+    )
+    final = sealer.seal_acceptance(
+        sealer.seal_issue(pdf, placement=p), stamp_lines=["ACEITE"], reason="Aceite"
+    )
+    roots = load_cert_files([pki["ca"]])
+    assert all(i.docmdp_ok is not False for i in inspect_signatures(final, roots))
+    # tentativa de acrescentar um novo campo de assinatura depois do aceite
+    w = IncrementalPdfFileWriter(io.BytesIO(final))
+    fields.append_signature_field(w, fields.SigFieldSpec("Intruso", on_page=0, box=(10, 10, 60, 40)))
+    out = io.BytesIO()
+    w.write(out)
+    infos = {i.field: i for i in inspect_signatures(out.getvalue(), roots)}
+    assert infos[FIELD_ACCEPT].modification_level == "OTHER" or not infos[FIELD_ACCEPT].docmdp_ok
+
+
+def test_stamp_text_nbsp_and_controls():
+    from pyhanko.pdf_utils.generic import encode_pdfdocencoding
+
+    from portal.signing.pades import winansi_safe
+
+    out = winansi_safe("Maria Aparecida­Silva\x07 — R$ 1.000")
+    assert out == "Maria AparecidaSilva - R$ 1.000"
+    encode_pdfdocencoding(out)  # não levanta: a linha inteira fica em PDFDocEncoding
+
+
+def test_policy_hash_length_validated(pki):
+    import pytest
+
+    from portal.signing.pades import Sealer, SealingError
+    from tests.conftest import PFX_PASSWORD
+
+    with pytest.raises(SealingError, match="bytes"):
+        Sealer(
+            pki["pfx"], PFX_PASSWORD, policy_oid="2.16.76.1.7.1.11.1.1", policy_hash_b64="YWJjZA=="
+        )  # 4 bytes, não 32
+
+
+def test_ltv_mode_with_document_timestamps(sealer, pki):
+    """PAdES-LTA: carimbos de documento aparecem na inspeção (antes quebravam)."""
+    from pyhanko.sign.timestamps.dummy_client import DummyTimeStamper
+
+    from portal.signing.pades import load_cert_files as lcf
+    from tests.test_anchoring import _tsa
+
+    tsa: DummyTimeStamper = _tsa()
+    sealer.timestamper = tsa
+    sealer.ltv_roots = lcf([pki["ca"]]) + [tsa.tsa_cert]
+    sealed = sealer.seal_issue(make_pdf(["Holerite LTA"]), placement=None)
+    infos = inspect_signatures(sealed, lcf([pki["ca"]]) + [tsa.tsa_cert])
+    kinds = {i.field.split(":")[0] for i in infos}
+    assert FIELD_ISSUE in kinds and "carimbo" in kinds
+    assert all(i.intact for i in infos)

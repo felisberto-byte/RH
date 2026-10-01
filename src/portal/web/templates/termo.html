@@ -10,11 +10,14 @@
     <p class="muted small">Versão {{ term.version }} · SHA-256 <span class="mono">{{ term.sha256 }}</span></p>
     <div class="term-text">{{ term.text }}</div>
     {% if accepted %}
-      <div class="alert ok">Você aceitou esta versão em {{ fmt_dt(accepted.accepted_at) }} ({{ accepted.channel }}).</div>
+      <div class="alert ok">Você aceitou esta versão em {{ fmt_dt(accepted.accepted_at) }} ({{ accepted.channel }}).
+        {% if accepted.receipt_key %}<a href="/termo/comprovante">Baixar comprovante</a>{% endif %}</div>
     {% else %}
       {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
       <form method="post" action="/termo" class="narrow-form">
         <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+        <input type="hidden" name="termo_id" value="{{ term.id }}">
+        <input type="hidden" name="termo_sha256" value="{{ term.sha256 }}">
         <label class="check"><input type="checkbox" name="concordo" value="sim" required>
           <span>Li e concordo com o Termo de Adesão acima.</span></label>
         {% if settings.accept_reauth == "password" %}

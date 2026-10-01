@@ -43,5 +43,10 @@ class DevAuthProvider:
             raise AuthError("Usuário ou senha inválidos.")
         return self._identity(username)
 
+    def refresh(self, identity: Identity) -> Identity | None:
+        if identity.username not in self.users:
+            return None
+        return self._identity(identity.username)
+
     def verify_password(self, identity: Identity, password: str) -> bool:
         return identity.username in self.users and hmac.compare_digest(password, self.password)

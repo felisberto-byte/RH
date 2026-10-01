@@ -4,12 +4,12 @@
 {% block content %}
 <h1>Meus documentos</h1>
 <nav class="tabs" aria-label="Filtro">
-  <a href="/documentos?aba=pendentes" class="{{ 'active' if aba != 'arquivados' }}">Pendentes ({{ pending|length }})</a>
-  <a href="/documentos?aba=arquivados" class="{{ 'active' if aba == 'arquivados' }}">Arquivados ({{ archived|length }})</a>
+  <a href="/documentos?aba=pendentes" class="{{ 'active' if aba != 'arquivados' }}" {% if aba != 'arquivados' %}aria-current="page"{% endif %}>Pendentes e novos ({{ pending|length + new|length }})</a>
+  <a href="/documentos?aba=arquivados" class="{{ 'active' if aba == 'arquivados' }}" {% if aba == 'arquivados' %}aria-current="page"{% endif %}>Arquivados ({{ archived|length }})</a>
 </nav>
-{% set items = archived if aba == 'arquivados' else pending %}
+{% set items = archived if aba == 'arquivados' else pending + new %}
 {% if not items %}
-  <p class="empty">{{ "Nenhum documento arquivado." if aba == 'arquivados' else "Você não tem documentos pendentes. 🎉" }}</p>
+  <p class="empty">{{ "Nenhum documento arquivado." if aba == 'arquivados' else "Você não tem documentos pendentes." }}</p>
 {% else %}
 <ul class="doclist">
   {% for d in items %}
@@ -19,7 +19,7 @@
       <span class="muted">{{ d.document_type.nome }}{% if d.competencia %} · competência {{ d.competencia }}{% endif %}</span>
       <span class="muted">Emitido em {{ fmt_dt(d.created_at) }}</span>
     </a>
-    {{ status_badge(d.status) }}
+    {% if d in new %}<span class="badge badge-pendente">Novo</span>{% else %}{{ status_badge(d.status) }}{% endif %}
   </li>
   {% endfor %}
 </ul>

@@ -162,6 +162,8 @@ def seeded(session):
     terms = TermService(session)
     term = terms.publish("1", DEFAULT_TERM_V1, published_by="rh.admin")
     for emp in (maria, joao):
-        terms.register(emp, term, channel="papel", registered_by="rh.admin", note="teste")
+        terms.register(
+            emp, term, channel="papel", actor_type="rh", registered_by="rh.admin", note="teste"
+        )
     session.commit()
     return {"maria": maria, "joao": joao, "holerite": holerite, "informe": informe, "term": term}

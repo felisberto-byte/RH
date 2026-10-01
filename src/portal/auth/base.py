@@ -30,3 +30,6 @@ class AuthProvider(Protocol):
 
     def verify_password(self, identity: Identity, password: str) -> bool:
         """Reautenticação (step-up) no momento do aceite."""
+
+    def refresh(self, identity: Identity) -> Identity | None:
+        """Revalida a conta (habilitada/grupos) sem senha; None = encerrar sessão."""

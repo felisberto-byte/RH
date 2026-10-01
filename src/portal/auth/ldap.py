@@ -141,45 +141,70 @@ class LdapAuthProvider:
             v = v[0] if v else None
         return str(v) if v not in (None, "") else None
 
-    # ---------------------------------------------------------------- API
-    def authenticate(self, username: str, password: str) -> Identity:
-        username = normalize_username(username)
-        if not password:
-            # Bind com senha vazia é um "unauthenticated bind" que o AD aceita.
-            raise AuthError("Usuário ou senha inválidos.")
-        conn = self._service_conn()
-        try:
-            entry = self._find_user(conn, username)
-            attrs = entry["attributes"]
-            raw = entry.get("raw_attributes", {})
-            dn = entry["dn"]
-            uac = int(self._first(attrs, "userAccountControl") or 0)
-            if uac & UAC_ACCOUNTDISABLE:
-                log.info("login recusado: conta desabilitada (%s)", username)
-                raise AuthError(BLOCKED_ERROR)
-            guid_raw = (raw.get("objectGUID") or [b""])[0]
-            if len(guid_raw) != 16:
-                raise AuthError("Conta sem objectGUID válido no diretório.")
-            object_guid = str(uuid.UUID(bytes_le=bytes(guid_raw)))
-            is_admin = self._in_group(conn, dn, self.s.ldap_group_admin_dn)
-            if self.s.ldap_group_users_dn and not (
-                is_admin or self._in_group(conn, dn, self.s.ldap_group_users_dn)
-            ):
-                raise AuthError("Seu usuário não tem acesso ao Portal do Colaborador.")
-        finally:
-            conn.unbind()
-
-        self._bind_user(dn, password)
+    def _identity_from(self, conn: Connection, entry: dict, fallback_username: str) -> Identity:
+        """Monta a identidade e aplica as checagens de conta (habilitada, grupos).
+        Só deve ser chamado DEPOIS de provada a senha (ou na revalidação), para
+        que mensagens diferentes não revelem quais contas existem."""
+        attrs = entry["attributes"]
+        raw = entry.get("raw_attributes", {})
+        dn = entry["dn"]
+        uac = int(self._first(attrs, "userAccountControl") or 0)
+        if uac & UAC_ACCOUNTDISABLE:
+            log.info("acesso recusado: conta desabilitada (%s)", fallback_username)
+            raise AuthError(BLOCKED_ERROR)
+        guid_raw = (raw.get("objectGUID") or [b""])[0]
+        if len(guid_raw) != 16:
+            raise AuthError("Conta sem objectGUID válido no diretório.")
+        is_admin = self._in_group(conn, dn, self.s.ldap_group_admin_dn)
+        if self.s.ldap_group_users_dn and not (
+            is_admin or self._in_group(conn, dn, self.s.ldap_group_users_dn)
+        ):
+            raise AuthError("Seu usuário não tem acesso ao Portal do Colaborador.")
         return Identity(
-            username=self._first(attrs, "sAMAccountName") or username,
-            display_name=self._first(attrs, "displayName") or username,
-            object_guid=object_guid,
+            username=self._first(attrs, "sAMAccountName") or fallback_username,
+            display_name=self._first(attrs, "displayName") or fallback_username,
+            object_guid=str(uuid.UUID(bytes_le=bytes(guid_raw))),
             dn=dn,
             upn=self._first(attrs, "userPrincipalName"),
             email=self._first(attrs, "mail"),
             employee_id=self._first(attrs, self.s.ldap_employee_id_attr),
             is_admin=is_admin,
         )
+
+    # ---------------------------------------------------------------- API
+    def authenticate(self, username: str, password: str) -> Identity:
+        username = normalize_username(username)
+        if not password:
+            # Bind com senha vazia é um "unauthenticated bind" que o AD aceita.
+            raise AuthError(GENERIC_ERROR)
+        conn = self._service_conn()
+        try:
+            try:
+                entry = self._find_user(conn, username)
+            except AuthError:
+                raise AuthError(GENERIC_ERROR) from None
+            # 1º prova a senha; só então revela estado da conta (desabilitada,
+            # fora do grupo) — sem isso dá para enumerar contas sem senha.
+            self._bind_user(entry["dn"], password)
+            return self._identity_from(conn, entry, username)
+        finally:
+            conn.unbind()
+
+    def refresh(self, identity: Identity) -> Identity | None:
+        """Revalida a conta durante a sessão (sem senha): ainda existe, está
+        habilitada e nos grupos? ``None`` = sessão deve ser encerrada."""
+        conn = self._service_conn()
+        try:
+            try:
+                entry = self._find_user(conn, identity.username)
+                fresh = self._identity_from(conn, entry, identity.username)
+            except AuthError:
+                return None
+            if fresh.object_guid != identity.object_guid:
+                return None
+            return fresh
+        finally:
+            conn.unbind()
 
     def _bind_user(self, dn: str, password: str) -> None:
         if not password:

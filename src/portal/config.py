@@ -40,10 +40,16 @@ class Settings(BaseSettings):
     auth_provider: Literal["ldap", "dev"] = "ldap"
     session_idle_minutes: int = 30
     session_absolute_hours: int = 8
+    # Limite por CONTA (bloqueio rígido, abaixo do lockoutThreshold do AD) e por IP
+    # (só falhas de login; alto o bastante para não bloquear o NAT do escritório).
     login_max_failures: int = 5
+    login_max_failures_per_ip: int = 50
     login_lockout_minutes: int = 15
-    # Número de proxies confiáveis à frente da aplicação (Google LB = 1, Cloud
-    # Run direto = 1). Usado para extrair o IP real do X-Forwarded-For.
+    # Revalida a conta no AD (habilitada, grupos) durante a sessão.
+    session_revalidate_minutes: int = 10
+    # Número de proxies confiáveis à frente da aplicação: Cloud Run direto = 1;
+    # Load Balancer externo -> Cloud Run = 2. Usado para extrair o IP real do
+    # X-Forwarded-For (nunca confie no valor mais à esquerda).
     trusted_proxy_hops: int = 0
 
     # --- Active Directory (LDAPS via VPN) -----------------------------------
@@ -74,6 +80,8 @@ class Settings(BaseSettings):
     tsa_url: str = ""
     tsa_username: str = ""
     tsa_password: SecretStr = SecretStr("")
+    # Produção sem ACT só com declaração explícita (fica registrado na evidência).
+    allow_no_tsa: bool = False
     # Política de assinatura ICP-Brasil (DOC-ICP-15.03), opcional. O hash pode ser
     # informado em hexadecimal (como na LPA) ou base64. Ver docs/assinatura-e-validade-juridica.md.
     signature_policy_oid: str = ""
@@ -115,12 +123,23 @@ class Settings(BaseSettings):
                 raise ValueError("auth_provider=dev é proibido em produção")
             if self.accept_reauth != "password":
                 raise ValueError("Em produção o aceite exige reautenticação (accept_reauth=password)")
-        if self.signing_ltv and not (self.tsa_url and self.signing_trust_root_files):
-            raise ValueError("signing_ltv exige PORTAL_TSA_URL e PORTAL_SIGNING_TRUST_ROOT_FILES")
             if not self.base_url.startswith("https://"):
                 raise ValueError("PORTAL_BASE_URL deve usar https em produção")
             if self.auth_provider == "ldap" and not self.ldap_url.startswith("ldaps://"):
                 raise ValueError("Em produção use LDAPS (ldaps://) para o AD")
+            if self.trusted_proxy_hops < 1:
+                raise ValueError(
+                    "Em produção informe PORTAL_TRUSTED_PROXY_HOPS (LB externo -> Cloud Run = 2)"
+                )
+            if not self.tsa_url and not self.allow_no_tsa:
+                raise ValueError(
+                    "Em produção configure PORTAL_TSA_URL (ACT) ou declare explicitamente "
+                    "PORTAL_ALLOW_NO_TSA=true (a ausência de carimbo do tempo constará na evidência)"
+                )
+            if self.docuseal_enabled and not self.docuseal_url.startswith("https://"):
+                raise ValueError("PORTAL_DOCUSEAL_URL deve usar https em produção")
+        if self.signing_ltv and not (self.tsa_url and self.signing_trust_root_files):
+            raise ValueError("signing_ltv exige PORTAL_TSA_URL e PORTAL_SIGNING_TRUST_ROOT_FILES")
         if self.docuseal_enabled and not (
             self.docuseal_url and self.docuseal_webhook_secret.get_secret_value()
         ):

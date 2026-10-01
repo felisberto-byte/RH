@@ -10,6 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from portal import audit
 from portal.audit import sha256_hex
 from portal.auth.base import AuthError, DirectoryUnavailable
+from portal.locks import account_lock, canonical_account, recent_failures, recent_ip_login_failures
 from portal.models import DocStatus, LoginAttempt
 from portal.signing.pades import inspect_signatures, load_cert_files
 from portal.web import security
@@ -20,6 +21,7 @@ from portal.web.deps import (
     document_service,
     find_employee_for,
     get_db,
+    link_problem,
     render,
     require_csrf,
 )
@@ -70,39 +72,51 @@ def login(
         return _login_page(request, "Formulário expirado. Tente novamente.", 400)
     ip = security.client_ip(request, s.trusted_proxy_hops)
     ua = security.user_agent(request)
-    uname = username.strip().lower()[:128]
-    if not uname or not password:
+    key = canonical_account(username)
+    if not key or not password:
         return _login_page(request, "Informe usuário e senha.", 400)
-    if security.too_many_failures(db, s, username=uname, ip=ip):
+    # Serializa por conta: checagem + bind + registro. Variações digitadas
+    # (DOMINIO\x, x@dominio) compartilham o mesmo contador.
+    account_lock(db, key)
+    if recent_failures(db, key=key, minutes=s.login_lockout_minutes) >= s.login_max_failures or (
+        recent_ip_login_failures(db, ip=ip, minutes=s.login_lockout_minutes)
+        >= s.login_max_failures_per_ip
+    ):
+        db.rollback()
         return _login_page(request, "Muitas tentativas. Aguarde alguns minutos.", 429)
     try:
         identity = ctx.auth.authenticate(username, password)
     except DirectoryUnavailable as exc:
+        db.rollback()
         return _login_page(request, str(exc), 503)
     except AuthError as exc:
-        db.add(LoginAttempt(username=uname, ip=ip, success=False))
+        db.add(LoginAttempt(username=key, ip=ip, success=False, purpose="login"))
         audit.record(
-            db, action="LOGIN_FALHOU", actor_type="colaborador", actor_ref=uname, ip=ip, user_agent=ua
+            db, action="LOGIN_FALHOU", actor_type="colaborador", actor_ref=key, ip=ip, user_agent=ua
         )
         db.commit()
         return _login_page(request, str(exc), 401)
 
     employee = find_employee_for(db, identity)
     if employee is not None:
-        if employee.ad_object_guid and employee.ad_object_guid != identity.object_guid:
+        problem = link_problem(employee, identity)
+        if problem:
             audit.record(
                 db,
-                action="VINCULO_AD_CONFLITO",
+                action=problem[0],
                 actor_type="sistema",
                 actor_ref=identity.username,
                 ip=ip,
-                data={"matricula": employee.matricula, "objectGUID": identity.object_guid},
+                data={
+                    "matricula": employee.matricula,
+                    "objectGUID": identity.object_guid,
+                    "matricula_no_ad": identity.employee_id,
+                },
             )
             db.commit()
-            return _login_page(
-                request, "Seu cadastro está vinculado a outro usuário. Procure o RH.", 403
-            )
+            return _login_page(request, problem[1], 403)
         if not employee.ativo:
+            db.rollback()
             return _login_page(request, "Cadastro inativo. Procure o RH.", 403)
         if employee.ad_object_guid is None:
             employee.ad_object_guid = identity.object_guid
@@ -116,7 +130,7 @@ def login(
                 data={"matricula": employee.matricula, "objectGUID": identity.object_guid},
             )
     elif not identity.is_admin:
-        db.add(LoginAttempt(username=uname, ip=ip, success=False))
+        db.add(LoginAttempt(username=key, ip=ip, success=False, purpose="login"))
         db.commit()
         return _login_page(
             request,
@@ -125,7 +139,7 @@ def login(
         )
 
     token, sess = security.create_session(db, identity, employee.id if employee else None, ip, ua)
-    db.add(LoginAttempt(username=uname, ip=ip, success=True))
+    db.add(LoginAttempt(username=key, ip=ip, success=True, purpose="login"))
     audit.record(
         db,
         action="LOGIN",
@@ -146,7 +160,7 @@ def login(
         samesite="lax",
         path="/",
     )
-    resp.delete_cookie(security.LOGIN_CSRF_COOKIE)
+    resp.delete_cookie(security.LOGIN_CSRF_COOKIE, secure=s.secure_cookies, samesite="strict")
     return resp
 
 
@@ -167,7 +181,10 @@ def logout(
     )
     db.commit()
     resp = RedirectResponse("/login?msg=saiu", status_code=303)
-    resp.delete_cookie(security.cookie_name(s), path="/")
+    # __Host- exige Secure também na remoção, senão o navegador ignora.
+    resp.delete_cookie(
+        security.cookie_name(s), path="/", secure=s.secure_cookies, httponly=True, samesite="lax"
+    )
     return resp
 
 

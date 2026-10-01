@@ -9,6 +9,27 @@
   <a class="stat" href="/rh/documentos?status={{ st }}"><strong>{{ counts.get(st, 0) }}</strong>{{ status_badge(st) }}</a>
   {% endfor %}
 </div>
+{% if divergences %}
+<section class="card">
+  <h2>Divergências registradas pelos colaboradores</h2>
+  <p class="muted small">O colaborador declarou ter recebido o documento, mas contestou o conteúdo. Trate cada caso e, se for o caso, cancele e reemita o documento.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Colaborador</th><th>Documento</th><th>Motivo informado</th><th>Registrado em</th></tr></thead>
+    <tbody>
+    {% for a in divergences %}
+    <tr>
+      <td>{{ a.document.employee.nome }}<br><span class="muted small">{{ a.document.employee.matricula }}</span></td>
+      <td>{{ a.document.titulo }}<br><span class="muted small">{{ a.document.competencia or "" }}</span></td>
+      <td>{{ a.reason or "—" }}</td>
+      <td>{{ fmt_dt(a.accepted_at) }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
 <div class="grid2">
   <section class="card">
     <h2>Últimos lotes</h2>

@@ -17,9 +17,11 @@
 {% if rep.get("erros") %}
 <section class="card">
   <h2>Pendências da importação ({{ rep["erros"]|length }})</h2>
+  <div class="table-wrap">
   <table><thead><tr><th>Origem</th><th>Chave</th><th>Erro</th></tr></thead><tbody>
   {% for e in rep["erros"] %}<tr><td>{{ e.get("origem") or e.get("arquivo") }}</td><td>{{ e.get("chave", "") }}</td><td>{{ e.get("erro") }}</td></tr>{% endfor %}
   </tbody></table>
+  </div>
 </section>
 {% endif %}
 {% if rep.get("paginas_sem_identificacao") %}

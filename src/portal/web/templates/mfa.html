@@ -6,6 +6,7 @@
   {% if enrolled %}
     <div class="alert ok">Seu aplicativo autenticador está configurado.</div>
     <p class="muted">Trocou de celular? Procure o RH/TI para redefinir.</p>
+    {% if next %}<p><a class="btn" href="{{ next }}">Continuar</a></p>{% endif %}
   {% else %}
     <p>Para confirmar seus aceites, use um aplicativo autenticador (Google Authenticator,
       Microsoft Authenticator, FreeOTP etc.). Ele é pessoal: não compartilhe.</p>
@@ -17,6 +18,9 @@
     {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
     <form method="post" action="/mfa">
       <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label for="senha-mfa">Confirme sua senha do computador</label>
+      <input id="senha-mfa" name="senha" type="password" autocomplete="current-password" required>
       <label for="codigo">Código de 6 dígitos exibido no aplicativo</label>
       <input id="codigo" name="codigo" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
       <button class="btn primary full" type="submit">Confirmar</button>

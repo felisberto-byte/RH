@@ -17,17 +17,19 @@ from datetime import datetime
 from sqlalchemy import (
     JSON,
     Boolean,
-    DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from portal.db import Base, utcnow
+from portal.db import Base, UTCDateTime, utcnow
 
 
 def new_uuid() -> str:
@@ -58,7 +60,7 @@ class Employee(Base):
     ad_object_guid: Mapped[str | None] = mapped_column(String(36), unique=True, nullable=True)
     ad_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     ativo: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     documents: Mapped[list[Document]] = relationship(back_populates="employee")
 
@@ -82,13 +84,18 @@ class DocumentType(Base):
     docuseal_template_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retention_years: Mapped[int] = mapped_column(Integer, default=10)
     ativo: Mapped[bool] = mapped_column(Boolean, default=True)
+    # "ciencia" (holerite, informe: "recebi e tomei ciência") ou "aceite"
+    # (contrato, aditivo: concordância). Define rótulos, carimbo e comprovante.
+    manifestation_kind: Mapped[str] = mapped_column(String(10), default="ciencia")
+    # Exige TOTP no ato mesmo que PORTAL_ACCEPT_MFA=none (ex.: contratos).
+    requires_totp: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class Batch(Base):
     __tablename__ = "lotes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     created_by: Mapped[str] = mapped_column(String(128))
     filename: Mapped[str] = mapped_column(String(255))
     source_sha256: Mapped[str] = mapped_column(String(64))
@@ -101,7 +108,18 @@ class Batch(Base):
 class Document(Base):
     __tablename__ = "documentos"
     __table_args__ = (
-        UniqueConstraint("employee_id", "document_type_id", "competencia", "original_sha256"),
+        # Mesmo PDF não pode ser emitido duas vezes para o mesmo colaborador/tipo/
+        # competência — exceto se o anterior foi cancelado (permite reemitir).
+        Index(
+            "uq_documentos_emissao_ativa",
+            "employee_id",
+            "document_type_id",
+            func.coalesce(text("competencia"), ""),
+            "original_sha256",
+            unique=True,
+            postgresql_where=text("status <> 'CANCELADO' AND original_sha256 IS NOT NULL"),
+            sqlite_where=text("status <> 'CANCELADO' AND original_sha256 IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -112,6 +130,10 @@ class Document(Base):
     titulo: Mapped[str] = mapped_column(String(200))
     competencia: Mapped[str | None] = mapped_column(String(7), nullable=True)  # AAAA-MM
     status: Mapped[DocStatus] = mapped_column(Enum(DocStatus, native_enum=False), index=True)
+    # Declaração fotografada na emissão: o texto exibido e registrado no aceite é
+    # este (alterar o tipo de documento depois não afeta documentos emitidos).
+    declaration_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    declaration_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     verification_code: Mapped[str] = mapped_column(String(20), unique=True, index=True)
 
     # Hashes SHA-256 (hex) de cada versão do arquivo. Documentos do motor
@@ -127,10 +149,10 @@ class Document(Base):
     final_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     receipt_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     created_by: Mapped[str] = mapped_column(String(128))
-    first_viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_viewed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Integração DocuSeal (motor opcional).
@@ -160,7 +182,7 @@ class Acceptance(Base):
     ad_upn: Mapped[str | None] = mapped_column(String(256), nullable=True)
     ip: Mapped[str] = mapped_column(String(45))
     user_agent: Mapped[str] = mapped_column(String(512))
-    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    accepted_at: Mapped[datetime] = mapped_column(UTCDateTime)
     reauth_method: Mapped[str] = mapped_column(String(32))
     session_ref: Mapped[str] = mapped_column(String(64))
     document_sha256: Mapped[str] = mapped_column(String(64))
@@ -178,7 +200,7 @@ class AuditEvent(Base):
     __tablename__ = "auditoria"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     actor_type: Mapped[str] = mapped_column(String(16))  # colaborador | rh | sistema
     actor_ref: Mapped[str] = mapped_column(String(128))
     action: Mapped[str] = mapped_column(String(48), index=True)
@@ -214,8 +236,9 @@ class UserSession(Base):
     csrf_token: Mapped[str] = mapped_column(String(64))
     ip: Mapped[str] = mapped_column(String(45))
     user_agent: Mapped[str] = mapped_column(String(512))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)
+    validated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -227,7 +250,7 @@ class LoginAttempt(Base):
     ip: Mapped[str] = mapped_column(String(45))
     success: Mapped[bool] = mapped_column(Boolean)
     purpose: Mapped[str] = mapped_column(String(16), default="login")  # login | aceite
-    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)
 
 
 class AdhesionTerm(Base):
@@ -241,7 +264,7 @@ class AdhesionTerm(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     published_by: Mapped[str] = mapped_column(String(128))
-    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    published_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
 class AdhesionAcceptance(Base):
@@ -252,12 +275,16 @@ class AdhesionAcceptance(Base):
     employee_id: Mapped[int] = mapped_column(ForeignKey("colaboradores.id"), index=True)
     term_id: Mapped[int] = mapped_column(ForeignKey("termos_adesao.id"))
     channel: Mapped[str] = mapped_column(String(16))  # portal | papel | govbr
-    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    accepted_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     ad_object_guid: Mapped[str | None] = mapped_column(String(36), nullable=True)
     ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
     registered_by: Mapped[str] = mapped_column(String(128))
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    receipt_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    receipt_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     term: Mapped[AdhesionTerm] = relationship()
 
@@ -270,9 +297,9 @@ class TotpCredential(Base):
 
     employee_id: Mapped[int] = mapped_column(ForeignKey("colaboradores.id"), primary_key=True)
     secret_enc: Mapped[str] = mapped_column(String(255))
-    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     last_used_step: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
 class AuditAnchor(Base):
@@ -281,7 +308,7 @@ class AuditAnchor(Base):
     __tablename__ = "auditoria_ancoras"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     head_event_id: Mapped[int] = mapped_column(Integer)
     head_hash: Mapped[str] = mapped_column(String(64))
     tsa_url: Mapped[str] = mapped_column(String(255))

@@ -109,8 +109,9 @@ def test_docuseal_end_to_end(app, fake, session, pki):
         data={"tipo": tipo, "matriculas": "000123", "titulo": "Contrato", "csrf": csrf},
         follow_redirects=False,
     )
-    assert r.status_code == 303
+    assert r.status_code == 200 and "1 pendência(s) criada(s): 000123" in r.text
     doc = session.query(Document).one()
+    assert doc.declaration_text == "Li e concordo." and doc.declaration_sha256
     doc_id = doc.id
     session.rollback()
 
@@ -126,7 +127,8 @@ def test_docuseal_end_to_end(app, fake, session, pki):
     r = maria.post(
         f"/documentos/{doc_id}/docuseal", data={"csrf": csrf, "senha": "dev"}, follow_redirects=False
     )
-    assert r.status_code == 303 and r.headers["location"] == f"{DS}/s/slug1"
+    # página intermediária com link (CSP form-action bloquearia redirecionar o POST)
+    assert r.status_code == 200 and f'href="{DS}/s/slug1"' in r.text
     sub = fake.created[0]["submitters"][0]
     assert fake.created[0]["send_email"] is False and sub["external_id"] == doc_id
     assert sub["metadata"]["sAMAccountName"] == "maria.silva"
@@ -136,7 +138,7 @@ def test_docuseal_end_to_end(app, fake, session, pki):
     r = maria.post(
         f"/documentos/{doc_id}/docuseal", data={"csrf": csrf, "senha": "dev"}, follow_redirects=False
     )
-    assert r.headers["location"].endswith("/s/slug2") and fake.archived == [11]
+    assert f'href="{DS}/s/slug2"' in r.text and fake.archived == [11]
 
     anon = TestClient(app)
     payload = {

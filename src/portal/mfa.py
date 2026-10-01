@@ -17,11 +17,12 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from markupsafe import Markup
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from portal import audit
 from portal.db import utcnow
-from portal.models import Employee, TotpCredential
+from portal.models import AuditEvent, Employee, TotpCredential
 
 STEP = 30
 
@@ -114,15 +115,41 @@ class TotpService:
         return True
 
     def verify(self, employee_id: int, code: str, now: float | None = None) -> bool:
-        """Valida e consome o código (não pode ser reutilizado)."""
+        """Valida e consome o código de forma ATÔMICA (UPDATE condicional): dois
+        pedidos simultâneos com o mesmo código não podem ambos ser aceitos."""
         cred = self.get(employee_id)
         if cred is None or cred.confirmed_at is None:
             return False
         step = self._match_step(self._secret(cred), code, now)
-        if step is None or step <= cred.last_used_step:
+        if step is None:
+            return False
+        res = self.db.execute(
+            update(TotpCredential)
+            .where(TotpCredential.employee_id == employee_id, TotpCredential.last_used_step < step)
+            .values(last_used_step=step)
+            .execution_options(synchronize_session=False)
+        )
+        if res.rowcount != 1:  # type: ignore[attr-defined]
             return False
         cred.last_used_step = step
         return True
+
+    def info(self, employee_id: int) -> dict:
+        """Histórico do segundo fator para a evidência (configuração e redefinições)."""
+        cred = self.get(employee_id)
+        reset_times = [
+            audit.iso_utc(ev.occurred_at)
+            for ev in self.db.scalars(
+                select(AuditEvent).where(AuditEvent.action == "MFA_REDEFINIDO").order_by(AuditEvent.id)
+            )
+            if (ev.data or {}).get("employee_id") == employee_id
+        ]
+        return {
+            "configurado_em_utc": audit.iso_utc(cred.confirmed_at)
+            if cred and cred.confirmed_at
+            else None,
+            "redefinicoes_utc": reset_times,
+        }
 
     def reset(self, employee_id: int, *, actor_ref: str, reason: str, ip: str | None) -> None:
         cred = self.get(employee_id)

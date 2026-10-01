@@ -4,10 +4,28 @@
 <h1>Trilha de auditoria</h1>
 {% include "admin/_nav.html" %}
 {% if report.ok %}
-<div class="alert ok">Cadeia íntegra: {{ report.checked }} eventos verificados. Hash atual: <span class="mono small">{{ report.head_hash }}</span></div>
+<div class="alert ok" role="status">Cadeia íntegra{% if report.last_anchored_event_id %} desde a última âncora (evento #{{ report.last_anchored_event_id }}){% endif %}:
+  {{ report.checked }} evento(s) verificados nesta tela. Hash atual: <span class="mono small">{{ report.head_hash }}</span></div>
 {% else %}
-<div class="alert error">Cadeia QUEBRADA no evento {{ report.first_bad_id }}: {{ report.reason }}. Acione a TI/segurança.</div>
+<div class="alert error" role="alert">Cadeia QUEBRADA{% if report.first_bad_id %} no evento {{ report.first_bad_id }}{% endif %}: {{ report.reason }}. Acione a TI/segurança e preserve os backups.</div>
 {% endif %}
+<p class="muted small">Esta tela confere apenas os eventos posteriores à última âncora. A verificação completa (cadeia inteira e carimbos do tempo) roda diariamente no job <code>portal verify-audit</code>.</p>
+<section class="card">
+  <h2>Âncoras (carimbo do tempo RFC 3161)</h2>
+  {% if not anchors %}<p class="muted">Nenhuma âncora registrada ainda. Configure o job <code>portal anchor-audit</code>.</p>{% else %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Evento</th><th>Registrada em</th><th>ACT</th><th>Hash ancorado</th></tr></thead>
+    <tbody>
+    {% for a in anchors %}
+    <tr><td>#{{ a.head_event_id }}</td><td>{{ fmt_dt(a.created_at) }}</td><td class="small">{{ a.tsa_url }}</td><td class="mono small">{{ a.head_hash[:16] }}…</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+<h2>Eventos recentes</h2>
 <div class="table-wrap">
 <table>
   <thead><tr><th>#</th><th>Data/hora</th><th>Ação</th><th>Ator</th><th>Documento</th><th>IP</th></tr></thead>

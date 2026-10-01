@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Tipos de documento{% endblock %}
+{% macro type_form(t) %}
+<form method="post" action="/rh/tipos">
+  {% set k = t.id if t else "novo" %}
+  <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+  <input type="hidden" name="tipo_id" value="{{ t.id if t else 0 }}">
+  <div class="grid2">
+    <div><label for="code-{{ k }}">Código</label>
+      <input id="code-{{ k }}" name="code" required pattern="[A-Za-z0-9_]{2,32}" value="{{ t.code if t else '' }}"></div>
+    <div><label for="nome-{{ k }}">Nome exibido</label>
+      <input id="nome-{{ k }}" name="nome" required minlength="3" maxlength="120" value="{{ t.nome if t else '' }}"></div>
+  </div>
+  <label for="decl-{{ k }}">Declaração apresentada ao colaborador</label>
+  <textarea id="decl-{{ k }}" name="declaracao" rows="4" required minlength="10">{{ t.declaration_text if t else '' }}</textarea>
+  <p class="muted small">Alterar o texto não afeta documentos já emitidos: a declaração é fotografada no momento da emissão.</p>
+  <div class="grid2">
+    <div><label for="nat-{{ k }}">Natureza da manifestação</label>
+      <select id="nat-{{ k }}" name="natureza">
+        <option value="ciencia" {{ "selected" if not t or t.manifestation_kind == "ciencia" }}>Ciência (holerite, informe, aviso)</option>
+        <option value="aceite" {{ "selected" if t and t.manifestation_kind == "aceite" }}>Aceite (contrato, aditivo, acordo)</option>
+      </select></div>
+    <div><label for="motor-{{ k }}">Motor</label>
+      <select id="motor-{{ k }}" name="motor">
+        <option value="nativo" {{ "selected" if not t or t.engine == "nativo" }}>Nativo (lote de PDFs com e-CNPJ)</option>
+        <option value="docuseal" {{ "selected" if t and t.engine == "docuseal" }}>DocuSeal (template)</option>
+      </select></div>
+  </div>
+  <label class="check"><input type="checkbox" name="exige_aceite" value="sim" {{ "checked" if not t or t.requires_acceptance }}> Exige manifestação do colaborador</label>
+  <label class="check"><input type="checkbox" name="exige_totp" value="sim" {{ "checked" if t and t.requires_totp }}> Exige código do aplicativo autenticador (recomendado para aceites)</label>
+  <div class="grid2">
+    <div><label for="anc-{{ k }}">Texto-âncora no PDF (onde o registro é carimbado)</label>
+      <input id="anc-{{ k }}" name="ancora_texto" maxlength="200" value="{{ t.anchor_text or '' if t else '' }}" placeholder="ex.: Assinatura do empregado"></div>
+    <div><label for="pag-{{ k }}">Página da caixa padrão (-1 = última)</label>
+      <input id="pag-{{ k }}" name="ancora_pagina" type="number" value="{{ t.anchor_page if t else -1 }}"></div>
+  </div>
+  <div class="grid2">
+    <div><label for="box-{{ k }}">Caixa padrão x1,y1,x2,y2 (pontos PDF)</label>
+      <input id="box-{{ k }}" name="ancora_caixa" class="mono" value="{{ (t.anchor_box or [300, 40, 560, 110])|join(',') if t else '300,40,560,110' }}"></div>
+    <div><label for="tpl-{{ k }}">Template DocuSeal (id)</label>
+      <input id="tpl-{{ k }}" name="docuseal_template_id" inputmode="numeric" value="{{ t.docuseal_template_id or '' if t else '' }}"></div>
+  </div>
+  <div class="grid2">
+    <div><label for="ret-{{ k }}">Retenção (anos)</label>
+      <input id="ret-{{ k }}" name="retencao_anos" type="number" min="1" value="{{ t.retention_years if t else 10 }}"></div>
+    <div><label class="check" style="margin-top:36px"><input type="checkbox" name="ativo" value="sim" {{ "checked" if not t or t.ativo }}> Ativo</label></div>
+  </div>
+  <button class="btn primary" type="submit">{{ "Salvar alterações" if t else "Criar tipo" }}</button>
+</form>
+{% endmacro %}
+{% block content %}
+<h1>Tipos de documento</h1>
+{% include "admin/_nav.html" %}
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+<p class="muted small">Cada alteração é registrada na trilha de auditoria com os valores anteriores e novos.</p>
+{% for t in types %}
+<section class="card">
+  <details>
+    <summary><strong>{{ t.nome }}</strong> <span class="muted small">{{ t.code }} · {{ "aceite" if t.manifestation_kind == "aceite" else "ciência" }} · {{ t.engine }}{% if not t.ativo %} · inativo{% endif %}</span></summary>
+    {{ type_form(t) }}
+  </details>
+</section>
+{% endfor %}
+<section class="card">
+  <h2>Novo tipo</h2>
+  {{ type_form(none) }}
+</section>
+{% endblock %}

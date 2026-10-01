@@ -1,8 +1,9 @@
-"""Área do RH: importação de lotes, acompanhamento, dossiê e cadastro."""
+"""Área do RH: importação de lotes, acompanhamento, dossiê, cadastro, tipos de
+documento, termo de adesão e auditoria. Rotas síncronas (rodam em thread):
+nada de E/S bloqueante no laço de eventos."""
 
 from __future__ import annotations
 
-import csv
 import io
 import json
 import re
@@ -11,14 +12,24 @@ import zipfile
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 
 from portal import audit
-from portal.audit import canonical_json
+from portal.audit import sha256_hex
 from portal.documents.ingest import DEFAULT_PATTERN, BatchImporter
 from portal.documents.service import DocumentError, NotFound, new_verification_code
+from portal.dossier import build_dossier
+from portal.employees import (
+    EmployeeImportError,
+    decode_csv,
+    parse_employees_csv,
+    revoke_sessions,
+    upsert_employees,
+)
 from portal.models import (
+    Acceptance,
+    AuditAnchor,
     AuditEvent,
     Batch,
     DocStatus,
@@ -26,6 +37,7 @@ from portal.models import (
     DocumentType,
     Employee,
     Engine,
+    new_uuid,
 )
 from portal.web import security
 from portal.web.deps import (
@@ -40,6 +52,7 @@ from portal.web.deps import (
 router = APIRouter(prefix="/rh")
 
 MAX_UPLOAD = 200 * 1024 * 1024
+_COMPETENCIA = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 
 
 def _check_csrf(user: CurrentUser, csrf: str) -> None:
@@ -51,6 +64,14 @@ def _ip(request: Request) -> str:
     return security.client_ip(request, app_ctx(request).settings.trusted_proxy_hops)
 
 
+def _read_upload(arquivo: UploadFile, limit: int) -> bytes:
+    data = arquivo.file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(status_code=413, detail="Arquivo maior que o limite permitido.")
+    return data
+
+
+# ------------------------------------------------------------------ painel
 @router.get("")
 def dashboard(
     request: Request, user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)
@@ -63,6 +84,12 @@ def dashboard(
         .order_by(Document.created_at)
         .limit(10)
     ).all()
+    divergences = db.scalars(
+        select(Acceptance)
+        .where(Acceptance.decision == "RECUSADO")
+        .order_by(Acceptance.accepted_at.desc())
+        .limit(10)
+    ).all()
     return render(
         request,
         "admin/painel.html",
@@ -70,33 +97,37 @@ def dashboard(
         counts=counts,
         batches=batches,
         oldest_pending=oldest_pending,
+        divergences=divergences,
     )
 
 
 # ------------------------------------------------------------------ lotes
+def _native_types(db: Session):
+    return db.scalars(
+        select(DocumentType).where(DocumentType.ativo.is_(True), DocumentType.engine == Engine.NATIVO)
+    ).all()
+
+
 @router.get("/lotes/novo")
 def batch_form(
     request: Request, user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)
 ):
-    types = db.scalars(
-        select(DocumentType).where(DocumentType.ativo.is_(True), DocumentType.engine == Engine.NATIVO)
-    ).all()
     return render(
         request,
         "admin/lote_novo.html",
         user=user,
-        types=types,
+        types=_native_types(db),
         default_pattern=DEFAULT_PATTERN,
         error=None,
     )
 
 
 @router.post("/lotes/novo")
-async def batch_upload(
+def batch_upload(
     request: Request,
-    tipo: int = Form(...),
+    tipo: int = Form(0),
     competencia: str = Form(""),
-    titulo: str = Form(...),
+    titulo: str = Form(""),
     chave: str = Form("matricula"),
     padrao: str = Form(DEFAULT_PATTERN),
     arquivo: UploadFile = File(...),
@@ -105,10 +136,7 @@ async def batch_upload(
     db: Session = Depends(get_db),
 ):
     _check_csrf(user, csrf)
-    doc_type = db.get(DocumentType, tipo)
-    types = db.scalars(
-        select(DocumentType).where(DocumentType.ativo.is_(True), DocumentType.engine == Engine.NATIVO)
-    ).all()
+    types = _native_types(db)
 
     def fail(msg: str, code: int = 400):
         return render(
@@ -121,20 +149,13 @@ async def batch_upload(
             error=msg,
         )
 
+    doc_type = db.get(DocumentType, tipo) if tipo else None
     if doc_type is None or doc_type.engine != Engine.NATIVO:
-        return fail("Tipo de documento inválido.")
-    try:
-        re.compile(padrao)
-    except re.error:
-        return fail("Expressão regular inválida.")
-    data = await arquivo.read(MAX_UPLOAD + 1)
-    if len(data) > MAX_UPLOAD:
-        return fail("Arquivo maior que 200 MB.", 413)
+        return fail("Escolha um tipo de documento válido.")
+    data = _read_upload(arquivo, MAX_UPLOAD)
     importer = BatchImporter(db, document_service(request, db))
     try:
-        # A assinatura (pyHanko) é síncrona e usa asyncio internamente: roda em thread.
-        batch, _ = await run_in_threadpool(
-            importer.run,
+        batch, _ = importer.run(
             filename=arquivo.filename or "lote",
             data=data,
             doc_type=doc_type,
@@ -159,7 +180,7 @@ def batch_detail(
 ):
     batch = db.get(Batch, batch_id)
     if batch is None:
-        raise HTTPException(status_code=404)
+        raise HTTPException(status_code=404, detail="Lote não encontrado.")
     return render(
         request,
         "admin/lote.html",
@@ -209,14 +230,17 @@ def cancel(
     db: Session = Depends(get_db),
 ):
     _check_csrf(user, csrf)
+    ctx = app_ctx(request)
     try:
-        document_service(request, db).cancel(
+        doc = document_service(request, db).cancel(
             doc_id, actor_ref=user.identity.username, reason=motivo, ip=_ip(request)
         )
     except NotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except DocumentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if doc.engine == Engine.DOCUSEAL and doc.docuseal_submission_id and ctx.docuseal:
+        ctx.docuseal.archive_submission(doc.docuseal_submission_id)
     return RedirectResponse("/rh/documentos?msg=cancelado", status_code=303)
 
 
@@ -227,58 +251,11 @@ def dossier(
     user: CurrentUser = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """ZIP com todos os arquivos, a evidência e os eventos de auditoria do documento."""
-    ctx = app_ctx(request)
+    """ZIP autossuficiente (arquivos, evidência, trilha, âncoras, script de verificação)."""
     doc = db.get(Document, doc_id)
     if doc is None:
-        raise HTTPException(status_code=404)
-    events = db.scalars(
-        select(AuditEvent).where(AuditEvent.document_id == doc.id).order_by(AuditEvent.id)
-    ).all()
-    buf = io.BytesIO()
-    files: dict[str, dict] = {}
-    manifest = {
-        "documento": doc.id,
-        "codigo_verificacao": doc.verification_code,
-        "status": doc.status,
-        "arquivos": files,
-    }
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for label, key, sha in (
-            ("1-original.pdf", doc.original_key, doc.original_sha256),
-            ("2-emitido-selado.pdf", doc.sealed_key, doc.sealed_sha256),
-            ("3-com-aceite.pdf", doc.final_key, doc.final_sha256),
-            ("4-comprovante.pdf", doc.receipt_key, doc.receipt_sha256),
-        ):
-            if key:
-                data = ctx.storage.get(key)
-                ok = audit.sha256_hex(data) == sha
-                zf.writestr(label, data)
-                files[label] = {"sha256": sha, "integro": ok}
-        if doc.acceptance:
-            zf.writestr("evidencia.json", doc.acceptance.evidence_json)
-        zf.writestr(
-            "auditoria.json",
-            json.dumps(
-                [
-                    {
-                        "id": e.id,
-                        "data_hora_utc": audit.iso_utc(e.occurred_at),
-                        "acao": e.action,
-                        "ator": f"{e.actor_type}:{e.actor_ref}",
-                        "ip": e.ip,
-                        "user_agent": e.user_agent,
-                        "dados": e.data,
-                        "hash_anterior": e.prev_hash,
-                        "hash": e.hash,
-                    }
-                    for e in events
-                ],
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-        zf.writestr("manifesto.json", canonical_json(manifest))
+        raise HTTPException(status_code=404, detail="Documento não encontrado.")
+    data, manifest = build_dossier(db, app_ctx(request).storage, doc)
     audit.record(
         db,
         action="DOSSIE_EXPORTADO",
@@ -286,20 +263,42 @@ def dossier(
         actor_ref=user.identity.username,
         document_id=doc.id,
         ip=_ip(request),
+        data={"arquivos": sorted(manifest["arquivos"]), "sha256_zip": sha256_hex(data)},
     )
     db.commit()
     return Response(
-        buf.getvalue(),
+        data,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="dossie-{doc.id}.zip"'},
     )
 
 
 # --------------------------------------------------- documentos DocuSeal
+def _docuseal_types(db: Session):
+    return db.scalars(
+        select(DocumentType).where(DocumentType.ativo.is_(True), DocumentType.engine == Engine.DOCUSEAL)
+    ).all()
+
+
+@router.get("/docuseal/emitir")
+def docuseal_form(
+    request: Request, user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)
+):
+    return render(
+        request,
+        "admin/docuseal_emitir.html",
+        user=user,
+        types=_docuseal_types(db),
+        error=None,
+        result=None,
+        enabled=app_ctx(request).docuseal is not None,
+    )
+
+
 @router.post("/docuseal/emitir")
 def docuseal_issue(
     request: Request,
-    tipo: int = Form(...),
+    tipo: int = Form(0),
     matriculas: str = Form(""),
     titulo: str = Form(""),
     competencia: str = Form(""),
@@ -308,24 +307,49 @@ def docuseal_issue(
     db: Session = Depends(get_db),
 ):
     """Cria pendências de assinatura via DocuSeal (o envio só é criado quando o
-    colaborador abre o documento no portal)."""
+    colaborador, autenticado, abre o documento no portal)."""
     _check_csrf(user, csrf)
-    doc_type = db.get(DocumentType, tipo)
+
+    def page(error=None, result=None, code=200):
+        return render(
+            request,
+            "admin/docuseal_emitir.html",
+            status_code=code,
+            user=user,
+            types=_docuseal_types(db),
+            error=error,
+            result=result,
+            enabled=app_ctx(request).docuseal is not None,
+        )
+
+    doc_type = db.get(DocumentType, tipo) if tipo else None
     if doc_type is None or doc_type.engine != Engine.DOCUSEAL or not doc_type.docuseal_template_id:
-        raise HTTPException(status_code=400, detail="Tipo DocuSeal inválido/sem template_id.")
+        return page("Tipo DocuSeal inválido ou sem template_id.", code=400)
+    if competencia and not _COMPETENCIA.fullmatch(competencia):
+        return page("Competência deve estar no formato AAAA-MM.", code=400)
     keys = [m for m in re.split(r"[\s,;]+", matriculas) if m]
-    created = 0
+    created, missing = [], []
     for key in keys:
-        emp = db.scalar(select(Employee).where(Employee.matricula == key, Employee.ativo.is_(True)))
+        emp = db.scalar(
+            select(Employee).where(
+                func.ltrim(Employee.matricula, "0") == (key.lstrip("0") or "0"),
+                Employee.ativo.is_(True),
+            )
+        )
         if emp is None:
+            missing.append(key)
             continue
+        declaration = doc_type.declaration_text
         doc = Document(
+            id=new_uuid(),
             employee_id=emp.id,
             document_type_id=doc_type.id,
             engine=Engine.DOCUSEAL,
             titulo=(titulo or doc_type.nome)[:200],
             competencia=competencia or None,
             status=DocStatus.PENDENTE,
+            declaration_text=declaration,
+            declaration_sha256=sha256_hex(declaration),
             verification_code=new_verification_code(),
             created_by=user.identity.username,
         )
@@ -342,11 +366,113 @@ def docuseal_issue(
                 "motor": "docuseal",
                 "template_id": doc_type.docuseal_template_id,
                 "colaborador_matricula": emp.matricula,
+                "declaracao_sha256": doc.declaration_sha256,
             },
         )
-        created += 1
+        created.append(emp.matricula)
     db.commit()
-    return RedirectResponse(f"/rh/documentos?status=PENDENTE&criados={created}", status_code=303)
+    return page(result={"criados": created, "nao_encontrados": missing})
+
+
+# ------------------------------------------------------- tipos de documento
+@router.get("/tipos")
+def doc_types(
+    request: Request, user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)
+):
+    types = db.scalars(select(DocumentType).order_by(DocumentType.code)).all()
+    return render(request, "admin/tipos.html", user=user, types=types, error=None)
+
+
+def _type_snapshot(t: DocumentType) -> dict:
+    return {
+        "code": t.code,
+        "nome": t.nome,
+        "requires_acceptance": t.requires_acceptance,
+        "manifestation_kind": t.manifestation_kind,
+        "requires_totp": t.requires_totp,
+        "declaration_sha256": sha256_hex(t.declaration_text or ""),
+        "anchor_text": t.anchor_text,
+        "anchor_page": t.anchor_page,
+        "anchor_box": list(t.anchor_box or []),
+        "engine": str(t.engine),
+        "docuseal_template_id": t.docuseal_template_id,
+        "retention_years": t.retention_years,
+        "ativo": t.ativo,
+    }
+
+
+@router.post("/tipos")
+def doc_type_save(
+    request: Request,
+    tipo_id: int = Form(0),
+    code: str = Form(""),
+    nome: str = Form(""),
+    declaracao: str = Form(""),
+    natureza: str = Form("ciencia"),
+    exige_aceite: str = Form(""),
+    exige_totp: str = Form(""),
+    ancora_texto: str = Form(""),
+    ancora_pagina: int = Form(-1),
+    ancora_caixa: str = Form("300,40,560,110"),
+    motor: str = Form("nativo"),
+    docuseal_template_id: str = Form(""),
+    retencao_anos: int = Form(10),
+    ativo: str = Form(""),
+    csrf: str = Form(""),
+    user: CurrentUser = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Cria/edita um tipo. Alterações são auditadas (valores antigo e novo) e
+    NÃO afetam documentos já emitidos (a declaração é fotografada na emissão)."""
+    _check_csrf(user, csrf)
+
+    def fail(msg: str):
+        types = db.scalars(select(DocumentType).order_by(DocumentType.code)).all()
+        return render(request, "admin/tipos.html", status_code=400, user=user, types=types, error=msg)
+
+    code = code.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_]{2,32}", code):
+        return fail("Código inválido (use letras maiúsculas, números e _).")
+    if len(nome.strip()) < 3 or len(declaracao.strip()) < 10:
+        return fail("Informe o nome e o texto completo da declaração.")
+    if natureza not in ("ciencia", "aceite") or motor not in ("nativo", "docuseal"):
+        return fail("Natureza ou motor inválido.")
+    try:
+        box = [int(v) for v in ancora_caixa.split(",")]
+        if len(box) != 4 or box[2] <= box[0] or box[3] <= box[1]:
+            raise ValueError
+    except ValueError:
+        return fail("Caixa da âncora inválida (x1,y1,x2,y2).")
+    template_id = int(docuseal_template_id) if docuseal_template_id.strip().isdigit() else None
+    if motor == "docuseal" and not template_id:
+        return fail("Tipos DocuSeal exigem o template_id.")
+    t = db.get(DocumentType, tipo_id) if tipo_id else None
+    before = _type_snapshot(t) if t else None
+    if t is None:
+        t = DocumentType(code=code)
+        db.add(t)
+    t.code, t.nome, t.declaration_text = code, nome.strip()[:120], declaracao.strip()
+    t.manifestation_kind, t.requires_acceptance = natureza, exige_aceite == "sim"
+    t.requires_totp, t.anchor_text = exige_totp == "sim", ancora_texto.strip() or None
+    t.anchor_page, t.anchor_box = ancora_pagina, box
+    t.engine = Engine(motor)
+    t.docuseal_template_id, t.retention_years = template_id, max(1, retencao_anos)
+    t.ativo = ativo == "sim"
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return fail("Já existe um tipo com este código.")
+    audit.record(
+        db,
+        action="TIPO_DOCUMENTO_ALTERADO" if before else "TIPO_DOCUMENTO_CRIADO",
+        actor_type="rh",
+        actor_ref=user.identity.username,
+        ip=_ip(request),
+        data={"antes": before, "depois": _type_snapshot(t)},
+    )
+    db.commit()
+    return RedirectResponse("/rh/tipos?msg=registrado", status_code=303)
 
 
 # ------------------------------------------------------------ colaboradores
@@ -358,44 +484,8 @@ def employees(
     return render(request, "admin/colaboradores.html", user=user, employees=emps, error=None)
 
 
-def parse_employees_csv(text: str) -> list[dict]:
-    """CSV com cabeçalho: matricula;nome;cpf;email;ativo (separador ; ou ,)."""
-    sample = text[:2048]
-    dialect = csv.Sniffer().sniff(sample, delimiters=";,") if sample else csv.excel
-    rows = []
-    for i, row in enumerate(csv.DictReader(io.StringIO(text), dialect=dialect), start=2):
-        row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-        if not row.get("matricula") or not row.get("nome"):
-            raise DocumentError(f"Linha {i}: matrícula e nome são obrigatórios.")
-        cpf = re.sub(r"\D", "", row.get("cpf", "")) or None
-        if cpf and len(cpf) != 11:
-            raise DocumentError(f"Linha {i}: CPF inválido.")
-        rows.append(
-            {
-                "matricula": row["matricula"],
-                "nome": row["nome"][:200],
-                "cpf": cpf,
-                "email": row.get("email") or None,
-                "ativo": row.get("ativo", "1").lower() not in ("0", "nao", "não", "false", "n"),
-            }
-        )
-    return rows
-
-
-def upsert_employees(db: Session, rows: list[dict]) -> int:
-    n = 0
-    for r in rows:
-        emp = db.scalar(select(Employee).where(Employee.matricula == r["matricula"]))
-        if emp is None:
-            emp = Employee(matricula=r["matricula"])
-            db.add(emp)
-        emp.nome, emp.cpf, emp.email, emp.ativo = r["nome"], r["cpf"], r["email"], r["ativo"]
-        n += 1
-    return n
-
-
 @router.post("/colaboradores/importar")
-async def employees_import(
+def employees_import(
     request: Request,
     arquivo: UploadFile = File(...),
     csrf: str = Form(""),
@@ -403,24 +493,27 @@ async def employees_import(
     db: Session = Depends(get_db),
 ):
     _check_csrf(user, csrf)
-    raw = await arquivo.read(10 * 1024 * 1024)
+    raw = arquivo.file.read(10 * 1024 * 1024 + 1)
     try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1")
-    try:
-        n = upsert_employees(db, parse_employees_csv(text))
+        result = upsert_employees(db, parse_employees_csv(decode_csv(raw)))
         audit.record(
             db,
             action="COLABORADORES_IMPORTADOS",
             actor_type="rh",
             actor_ref=user.identity.username,
             ip=_ip(request),
-            data={"arquivo": arquivo.filename, "registros": n, "sha256": audit.sha256_hex(raw)},
+            data={
+                "arquivo": arquivo.filename,
+                "criados": result.created,
+                "atualizados": result.updated,
+                "desativados": result.deactivated,
+                "sha256": sha256_hex(raw),
+            },
         )
         db.commit()
-    except (DocumentError, csv.Error) as exc:
+    except (EmployeeImportError, IntegrityError) as exc:
         db.rollback()
+        msg = str(exc) if isinstance(exc, EmployeeImportError) else "Dados conflitantes no CSV."
         emps = db.scalars(select(Employee).order_by(Employee.nome)).all()
         return render(
             request,
@@ -428,9 +521,47 @@ async def employees_import(
             status_code=400,
             user=user,
             employees=emps,
-            error=str(exc),
+            error=msg,
         )
     return RedirectResponse("/rh/colaboradores?msg=importado", status_code=303)
+
+
+@router.post("/colaboradores/{employee_id}/desvincular")
+def employee_unlink(
+    employee_id: int,
+    request: Request,
+    motivo: str = Form(""),
+    csrf: str = Form(""),
+    user: CurrentUser = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Remove o vínculo com a conta do AD (ex.: conta recriada na readmissão).
+    O próximo login com a matrícula correta cria o novo vínculo."""
+    _check_csrf(user, csrf)
+    emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(status_code=404, detail="Colaborador não encontrado.")
+    if len(motivo.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Descreva o motivo (mínimo 10 caracteres).")
+    old_guid, old_user = emp.ad_object_guid, emp.ad_username
+    emp.ad_object_guid = None
+    emp.ad_username = None
+    revoke_sessions(db, emp.id)
+    audit.record(
+        db,
+        action="VINCULO_AD_REMOVIDO",
+        actor_type="rh",
+        actor_ref=user.identity.username,
+        ip=_ip(request),
+        data={
+            "matricula": emp.matricula,
+            "objectGUID_anterior": old_guid,
+            "usuario_anterior": old_user,
+            "motivo": motivo.strip()[:500],
+        },
+    )
+    db.commit()
+    return RedirectResponse("/rh/colaboradores?msg=registrado", status_code=303)
 
 
 # ----------------------------------------------------------------- auditoria
@@ -438,9 +569,25 @@ async def employees_import(
 def audit_view(
     request: Request, user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)
 ):
-    report = audit.verify_chain(db)
+    """Verificação INCREMENTAL a partir da última âncora (a completa roda no job
+    diário ``portal verify-audit``)."""
+    last = db.scalar(select(AuditAnchor).order_by(AuditAnchor.id.desc()))
+    if last is not None:
+        ev = db.get(AuditEvent, last.head_event_id)
+        if ev is None or ev.hash != last.head_hash:
+            report = audit.ChainReport(
+                False, 0, last.head_event_id, "evento ancorado foi alterado ou removido"
+            )
+        else:
+            report = audit.verify_chain(db, start_after_id=last.head_event_id, start_hash=last.head_hash)
+            report.last_anchored_event_id = last.head_event_id
+    else:
+        report = audit.verify_chain(db)
+    anchors = db.scalars(select(AuditAnchor).order_by(AuditAnchor.id.desc()).limit(10)).all()
     events = db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(200)).all()
-    return render(request, "admin/auditoria.html", user=user, report=report, events=events)
+    return render(
+        request, "admin/auditoria.html", user=user, report=report, events=events, anchors=anchors
+    )
 
 
 # ------------------------------------------------------- termo de adesão
@@ -475,7 +622,11 @@ def term_publish(
     _check_csrf(user, csrf)
     terms = TermService(db)
     try:
-        terms.publish(versao, texto.replace("\r\n", "\n"), published_by=user.identity.username)
+        term = terms.publish(versao, texto.replace("\r\n", "\n"), published_by=user.identity.username)
+        # Cópia imutável do texto publicado (bucket com retenção).
+        app_ctx(request).storage.put(
+            f"termos/{term.id}/termo-v{term.version}.txt", term.text.encode(), "text/plain"
+        )
         db.commit()
     except ValueError as exc:
         db.rollback()
@@ -501,15 +652,21 @@ def term_external(
     user: CurrentUser = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Registra adesão coletada fora do portal (papel assinado ou gov.br)."""
+    """Registra adesão coletada FORA do portal (papel assinado ou gov.br)."""
     from portal.terms import TermService
 
     _check_csrf(user, csrf)
+    if canal not in ("papel", "govbr"):
+        raise HTTPException(status_code=400, detail="Canal inválido: use papel ou gov.br.")
     emp = db.get(Employee, employee_id)
+    if emp is None:
+        raise HTTPException(status_code=404, detail="Colaborador não encontrado.")
     terms = TermService(db)
     term = terms.active()
-    if emp is None or term is None:
-        raise HTTPException(status_code=404)
+    if term is None:
+        raise HTTPException(
+            status_code=400, detail="Nenhum termo publicado; publique em 'Termo de adesão'."
+        )
     if len(observacao.strip()) < 5:
         raise HTTPException(status_code=400, detail="Informe onde o termo físico está arquivado.")
     try:
@@ -517,13 +674,15 @@ def term_external(
             emp,
             term,
             channel=canal,
+            actor_type="rh",
             registered_by=user.identity.username,
             ip=_ip(request),
             note=observacao.strip()[:500],
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    db.commit()
+        db.commit()
+    except (ValueError, IntegrityError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc) or "Termo já aceito.") from exc
     return RedirectResponse("/rh/colaboradores?msg=registrado", status_code=303)
 
 
@@ -540,10 +699,11 @@ def mfa_reset(
 
     _check_csrf(user, csrf)
     if db.get(Employee, employee_id) is None:
-        raise HTTPException(status_code=404)
+        raise HTTPException(status_code=404, detail="Colaborador não encontrado.")
     if len(motivo.strip()) < 5:
         raise HTTPException(status_code=400, detail="Informe o motivo da redefinição.")
     s = app_ctx(request).settings
+    revoke_sessions(db, employee_id)
     TotpService(db, s.secret_key.get_secret_value(), s.totp_issuer).reset(
         employee_id, actor_ref=user.identity.username, reason=motivo.strip()[:500], ip=_ip(request)
     )
@@ -562,12 +722,28 @@ def employee_package(
     ctx = app_ctx(request)
     emp = db.get(Employee, employee_id)
     if emp is None:
-        raise HTTPException(status_code=404)
+        raise HTTPException(status_code=404, detail="Colaborador não encontrado.")
     docs = db.scalars(
         select(Document).where(Document.employee_id == emp.id).order_by(Document.created_at)
     ).all()
     buf = io.BytesIO()
     index = []
+
+    def read(key: str, sha: str | None, doc_id: str) -> bytes:
+        data = ctx.storage.get(key)
+        if sha and sha256_hex(data) != sha:
+            audit.record(
+                db,
+                action="INTEGRIDADE_FALHOU",
+                actor_type="sistema",
+                actor_ref="portal",
+                document_id=doc_id,
+                data={"key": key, "esperado": sha},
+            )
+            db.commit()
+            raise HTTPException(status_code=500, detail=f"Falha de integridade: {doc_id}")
+        return data
+
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for d in docs:
             if d.status == DocStatus.CANCELADO:
@@ -581,13 +757,10 @@ def employee_package(
                 "codigo_verificacao": d.verification_code,
             }
             if key:
-                data = ctx.storage.get(key)
-                if audit.sha256_hex(data) != sha:
-                    raise HTTPException(status_code=500, detail=f"Integridade falhou: {d.id}")
-                zf.writestr(f"{base}.pdf", data)
+                zf.writestr(f"{base}.pdf", read(key, sha, d.id))
                 entry["arquivo"], entry["sha256"] = f"{base}.pdf", sha
             if d.receipt_key:
-                zf.writestr(f"{base}_comprovante.pdf", ctx.storage.get(d.receipt_key))
+                zf.writestr(f"{base}_comprovante.pdf", read(d.receipt_key, d.receipt_sha256, d.id))
                 entry["comprovante_sha256"] = d.receipt_sha256
             index.append(entry)
         zf.writestr("indice.json", json.dumps(index, ensure_ascii=False, indent=2))

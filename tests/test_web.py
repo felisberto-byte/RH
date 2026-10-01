@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import re
+import subprocess
+import sys
 import zipfile
 
 import pytest
@@ -81,7 +83,7 @@ def test_login_rejects_bad_password_and_missing_csrf(app):
     assert r.status_code == 400
 
 
-def test_end_to_end_batch_view_accept_verify(app, batch_pdf, session):
+def test_end_to_end_batch_view_accept_verify(app, batch_pdf, session, tmp_path):
     admin = TestClient(app)
     assert login(admin, "rh.admin").headers["location"] == "/rh"
     r = upload_batch(admin, batch_pdf)
@@ -158,15 +160,32 @@ def test_end_to_end_batch_view_accept_verify(app, batch_pdf, session):
     with zipfile.ZipFile(io.BytesIO(z.content)) as zf:
         names = set(zf.namelist())
         manifest = json.loads(zf.read("manifesto.json"))
+        zf.extractall(tmp_path)
     assert {
         "1-original.pdf",
         "2-emitido-selado.pdf",
-        "3-com-aceite.pdf",
+        "3-com-registro.pdf",
         "4-comprovante.pdf",
         "evidencia.json",
-        "auditoria.json",
+        "auditoria/segmento.jsonl",
+        "verificar.py",
+        "LEIA-ME.txt",
     } <= names
     assert all(v["integro"] for v in manifest["arquivos"].values())
+    # o script autônomo do dossiê confere arquivos e a cadeia sem o portal
+    out = subprocess.run(
+        [sys.executable, "verificar.py"], cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+    assert out.returncode == 0 and "ÍNTEGRO" in out.stdout, out.stdout
+    seg = (tmp_path / "auditoria" / "segmento.jsonl").read_text(encoding="utf-8").splitlines()
+    first = json.loads(seg[0])
+    first["payload"]["ip"] = "1.2.3.4"  # adulteração é detectada
+    seg[0] = json.dumps(first, ensure_ascii=False)
+    (tmp_path / "auditoria" / "segmento.jsonl").write_text("\n".join(seg), encoding="utf-8")
+    out = subprocess.run(
+        [sys.executable, "verificar.py"], cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+    assert out.returncode == 1 and "FALHA hash do evento" in out.stdout
 
     audit_page = admin.get("/rh/auditoria")
     assert "Cadeia íntegra" in audit_page.text

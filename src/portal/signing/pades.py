@@ -23,15 +23,18 @@ Com ``tsa_url`` configurado as assinaturas recebem carimbo do tempo
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
 import io
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from asn1crypto import algos, core
 from asn1crypto import x509 as asn1_x509
 from pyhanko.pdf_utils import text as pdf_text
+from pyhanko.pdf_utils.generic import encode_pdfdocencoding
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers, timestamps
@@ -42,7 +45,7 @@ from pyhanko.sign.ades.cades_asn1 import (
     SigPolicyQualifierInfo,
     SigPolicyQualifierInfos,
 )
-from pyhanko.sign.validation import validate_pdf_signature
+from pyhanko.sign.validation import validate_pdf_signature, validate_pdf_timestamp
 from pyhanko.stamp import TextStampStyle
 from pyhanko_certvalidator import ValidationContext
 
@@ -54,12 +57,21 @@ FIELD_RECEIPT = "SeloEmpresaComprovante"
 FIELD_FINAL = "SeloEmpresaFinal"
 
 
-def _decode_policy_hash(value: str) -> bytes:
-    """Aceita o hash da política em hexadecimal (como publicado na LPA) ou base64."""
+def _decode_policy_hash(value: str, alg: str) -> bytes:
+    """Aceita o hash da política em hexadecimal (como publicado na LPA) ou base64,
+    e confere o tamanho contra o algoritmo (evita embutir um hash errado)."""
     v = value.strip()
-    if len(v) in (64, 96, 128) and all(c in "0123456789abcdefABCDEF" for c in v):
-        return bytes.fromhex(v)
-    return base64.b64decode(v)
+    size = hashlib.new(alg).digest_size
+    if len(v) == 2 * size and all(c in "0123456789abcdefABCDEF" for c in v):
+        digest = bytes.fromhex(v)
+    else:
+        try:
+            digest = base64.b64decode(v, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise SealingError("hash da política inválido (use hex ou base64)") from exc
+    if len(digest) != size:
+        raise SealingError(f"hash da política com {len(digest)} bytes; {alg} exige {size}")
+    return digest
 
 
 _STAMP_REPLACEMENTS = str.maketrans(
@@ -70,17 +82,34 @@ _STAMP_REPLACEMENTS = str.maketrans(
 def winansi_safe(text: str) -> str:
     """Mantém o texto representável na fonte padrão do carimbo.
 
-    Na prática só o Latin-1 renderiza corretamente (acentos do português, "·");
-    pontuação tipográfica é trocada por equivalente ASCII e outros caracteres
-    viram a letra-base (ex.: "ł" -> "l") ou "?".
+    A fonte padrão só renderiza corretamente o que existe em PDFDocEncoding
+    (acentos do português, "·"). Espaços Unicode (ex.: NBSP vindo de planilhas)
+    viram espaço comum, caracteres de controle e hífen suave são descartados,
+    pontuação tipográfica vira ASCII e o restante vira a letra-base ou "?".
+    Um único caractere fora da codificação faria a linha inteira ser gravada em
+    UTF-16 e sair ilegível.
     """
     out = []
     for ch in text.translate(_STAMP_REPLACEMENTS):
-        if ord(ch) < 256:
-            out.append(ch)
+        cat = unicodedata.category(ch)
+        if cat == "Zs":
+            out.append(" ")
             continue
+        if cat in ("Cc", "Cf") or ch == "\u00ad":
+            continue
+        candidates = [ch]
         base = "".join(c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c))
-        out.append(base if base and all(ord(c) < 256 for c in base) else "?")
+        if base and base != ch:
+            candidates.append(base)
+        for cand in candidates:
+            try:
+                encode_pdfdocencoding(cand)
+            except (UnicodeEncodeError, KeyError, ValueError):
+                continue
+            out.append(cand)
+            break
+        else:
+            out.append("?")
     return "".join(out)
 
 
@@ -135,13 +164,14 @@ class Sealer:
         )
         # PAdES B-LT/B-LTA: embute cadeia + CRL/OCSP (DSS) e carimbo de documento,
         # para que a assinatura continue verificável após o vencimento do A1.
-        self.ltv_vc: ValidationContext | None = None
+        # O ValidationContext é criado a CADA assinatura (ele congela o instante
+        # de validação e guarda CRLs em cache; reutilizá-lo no processo inteiro
+        # faria assinaturas falharem ou embutirem revogação desatualizada).
+        self.ltv_roots: list[asn1_x509.Certificate] | None = None
         if ltv_trust_roots:
             if self.timestamper is None:
                 raise SealingError("LTV exige uma TSA configurada (PORTAL_TSA_URL)")
-            self.ltv_vc = ValidationContext(
-                trust_roots=load_cert_files(ltv_trust_roots), allow_fetching=True
-            )
+            self.ltv_roots = load_cert_files(ltv_trust_roots)
         # Política de assinatura ICP-Brasil (DOC-ICP-15.03, ex.: PA_PAdES_AD_RB/AD_RT).
         # O OID e o hash vêm da LPA publicada pelo ITI; pyHanko apenas embute o
         # identificador — cabe a nós cumprir as regras da política.
@@ -154,7 +184,7 @@ class Sealer:
                 "sig_policy_hash": algos.DigestInfo(
                     {
                         "digest_algorithm": {"algorithm": policy_hash_alg},
-                        "digest": _decode_policy_hash(policy_hash_b64),
+                        "digest": _decode_policy_hash(policy_hash_b64, policy_hash_alg),
                     }
                 ),
             }
@@ -185,6 +215,21 @@ class Sealer:
     def not_valid_after(self) -> datetime:
         return self.certificate["tbs_certificate"]["validity"]["not_after"].native
 
+    def not_valid_before(self) -> datetime:
+        return self.certificate["tbs_certificate"]["validity"]["not_before"].native
+
+    def ensure_valid(self) -> None:
+        """Recusa selar com certificado vencido (ou ainda não válido): o selo
+        sairia inválido sem nenhum aviso."""
+        now = datetime.now(UTC)
+        if now < self.not_valid_before():
+            raise SealingError("certificado de assinatura ainda não é válido")
+        if now > self.not_valid_after():
+            raise SealingError(
+                f"certificado de assinatura VENCIDO em {self.not_valid_after():%d/%m/%Y}; "
+                "renove o e-CNPJ (ver docs/operacao.md)"
+            )
+
     def _meta(
         self, field_name: str, reason: str, *, commitment=None, **kw
     ) -> signers.PdfSignatureMetadata:
@@ -193,9 +238,12 @@ class Sealer:
             cades = CAdESSignedAttrSpec(
                 signature_policy_identifier=self.policy_id, commitment_type=commitment
             )
-        if self.ltv_vc is not None:
+        if self.ltv_roots is not None:
             kw.setdefault("embed_validation_info", True)
-            kw.setdefault("validation_context", self.ltv_vc)
+            kw.setdefault(
+                "validation_context",
+                ValidationContext(trust_roots=self.ltv_roots, allow_fetching=True),
+            )
             kw.setdefault("use_pades_lta", True)
         return signers.PdfSignatureMetadata(
             field_name=field_name,
@@ -222,10 +270,19 @@ class Sealer:
         self, pdf: bytes, *, placement: Placement | None, reason: str = "Emissão do documento"
     ) -> bytes:
         """Certifica o documento; se ``placement`` for dado, cria o campo de aceite."""
+        self.ensure_valid()
         w = self._writer(pdf)
-        existing = list(PdfFileReader(io.BytesIO(pdf), strict=False).embedded_signatures)
-        if existing:
+        reader = PdfFileReader(io.BytesIO(pdf), strict=False)
+        if list(reader.embedded_signatures):
             raise SealingError("o PDF de origem já contém assinaturas; envie o PDF sem assinatura")
+        editable = _editable_form_fields(reader)
+        if editable:
+            # Com DocMDP P=2, campos de formulário poderiam ser preenchidos depois
+            # (ex.: alterar um valor) sem invalidar a certificação.
+            raise SealingError(
+                "o PDF contém campos de formulário editáveis "
+                f"({', '.join(editable[:5])}); exporte o PDF 'achatado'/sem formulário"
+            )
         if placement is not None:
             fields.append_signature_field(
                 w,
@@ -234,6 +291,9 @@ class Sealer:
                     on_page=placement.page,
                     box=placement.box,
                     readable_field_name="Aceite do colaborador",
+                    # Depois de assinado o aceite, nada mais pode ser alterado.
+                    field_mdp_spec=fields.FieldMDPSpec(fields.FieldMDPAction.ALL),
+                    doc_mdp_update_value=fields.MDPPerm.NO_CHANGES,
                 ),
             )
             perm = fields.MDPPerm.FILL_FORMS
@@ -246,16 +306,20 @@ class Sealer:
             certify=True,
             docmdp_permissions=perm,
         )
-        out = signers.PdfSigner(
-            meta,
-            self.signer,
-            timestamper=self.timestamper,
-            new_field_spec=fields.SigFieldSpec(FIELD_ISSUE),
-        ).sign_pdf(w)
+        try:
+            out = signers.PdfSigner(
+                meta,
+                self.signer,
+                timestamper=self.timestamper,
+                new_field_spec=fields.SigFieldSpec(FIELD_ISSUE),
+            ).sign_pdf(w)
+        except Exception as exc:  # noqa: BLE001 - inclui falhas da ACT/rede
+            raise SealingError(f"falha ao selar o documento: {exc}") from exc
         return out.getvalue()
 
     # ----------------------------------------------------------------- aceite
     def seal_acceptance(self, sealed_pdf: bytes, *, stamp_lines: list[str], reason: str) -> bytes:
+        self.ensure_valid()
         w = self._writer(sealed_pdf)
         style = TextStampStyle(
             stamp_text="\n".join(winansi_safe(line).replace("%", "%%") for line in stamp_lines),
@@ -265,7 +329,9 @@ class Sealer:
             border_width=1,
             background_opacity=0,
         )
-        meta = self._meta(FIELD_ACCEPT, reason)
+        # O campo foi criado com /Lock P=1: após o aceite nada mais muda no
+        # documento (exceto DSS/carimbos de LTV). Declarar o mesmo valor aqui.
+        meta = self._meta(FIELD_ACCEPT, reason, docmdp_permissions=fields.MDPPerm.NO_CHANGES)
         try:
             out = signers.PdfSigner(
                 meta, self.signer, timestamper=self.timestamper, stamp_style=style
@@ -275,21 +341,25 @@ class Sealer:
         return out.getvalue()
 
     # ------------------------------------------------------------ comprovante
-    def seal_receipt(self, pdf: bytes) -> bytes:
+    def seal_receipt(self, pdf: bytes, reason: str = "Comprovante de manifestação eletrônica") -> bytes:
+        self.ensure_valid()
         w = self._writer(pdf)
         meta = self._meta(
             FIELD_RECEIPT,
-            "Comprovante de aceite eletrônico",
+            reason,
             commitment=GenericCommitment.PROOF_OF_ORIGIN.asn1,
             certify=True,
             docmdp_permissions=fields.MDPPerm.NO_CHANGES,
         )
-        out = signers.PdfSigner(
-            meta,
-            self.signer,
-            timestamper=self.timestamper,
-            new_field_spec=fields.SigFieldSpec(FIELD_RECEIPT),
-        ).sign_pdf(w)
+        try:
+            out = signers.PdfSigner(
+                meta,
+                self.signer,
+                timestamper=self.timestamper,
+                new_field_spec=fields.SigFieldSpec(FIELD_RECEIPT),
+            ).sign_pdf(w)
+        except Exception as exc:  # noqa: BLE001
+            raise SealingError(f"falha ao selar o comprovante: {exc}") from exc
         return out.getvalue()
 
     # ------------------------------------------------- selo final (DocuSeal)
@@ -297,6 +367,7 @@ class Sealer:
         """Assinatura de aprovação (incremental) sobre um PDF já assinado por
         terceiros (ex.: resultado do DocuSeal). Deve ser a ÚLTIMA assinatura:
         o DocuSeal achata/reescreve o PDF e invalidaria um selo aplicado antes."""
+        self.ensure_valid()
         w = self._writer(pdf)
         meta = self._meta(FIELD_FINAL, reason)
         try:
@@ -312,11 +383,12 @@ class Sealer:
 
 
 def inspect_signatures(pdf: bytes, trust_roots: list[asn1_x509.Certificate]) -> list[SignatureInfo]:
-    """Valida as assinaturas embutidas (integridade, cadeia, DocMDP)."""
+    """Valida as assinaturas embutidas (integridade, cadeia, DocMDP) e os
+    carimbos de documento (PAdES-LTA), estes com ``field`` prefixado "carimbo:"."""
     vc = ValidationContext(trust_roots=trust_roots, allow_fetching=False)
     reader = PdfFileReader(io.BytesIO(pdf), strict=False)
     infos = []
-    for sig in reader.embedded_signatures:
+    for sig in reader.embedded_regular_signatures:
         st = validate_pdf_signature(sig, vc)
         infos.append(
             SignatureInfo(
@@ -332,7 +404,46 @@ def inspect_signatures(pdf: bytes, trust_roots: list[asn1_x509.Certificate]) -> 
                 modification_level=st.modification_level.name if st.modification_level else "",
             )
         )
+    for ts in reader.embedded_timestamp_signatures:
+        tst = validate_pdf_timestamp(ts, vc)
+        infos.append(
+            SignatureInfo(
+                field=f"carimbo:{ts.field_name}",
+                signer_subject=tst.signing_cert.subject.human_friendly,
+                signing_time=tst.timestamp,
+                timestamped=True,
+                intact=tst.intact,
+                valid=tst.valid,
+                trusted=tst.trusted,
+                docmdp_ok=None,
+                coverage=tst.coverage.name if tst.coverage else "",
+                modification_level=tst.modification_level.name if tst.modification_level else "",
+            )
+        )
     return infos
+
+
+def _editable_form_fields(reader: PdfFileReader) -> list[str]:
+    """Nomes dos campos de formulário que NÃO são de assinatura."""
+    acro = reader.root.get("/AcroForm")
+    if acro is None:
+        return []
+    acro = acro.get_object()
+    found: list[str] = []
+
+    def walk(field, inherited_ft=None):
+        field = field.get_object()
+        ft = field.get("/FT", inherited_ft)
+        kids = field.get("/Kids")
+        if kids:
+            for kid in kids:
+                walk(kid, ft)
+        elif ft is not None and ft != "/Sig":
+            found.append(str(field.get("/T", "?")))
+
+    for f in acro.get("/Fields", []) or []:
+        walk(f)
+    return found
 
 
 def load_cert_files(paths: list[Path]) -> list[asn1_x509.Certificate]:

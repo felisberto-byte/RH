@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Assinatura{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Tudo pronto para assinar</h1>
+  <p>Sua identidade foi confirmada. O link abaixo é pessoal, vale por 2 horas e abre a tela
+    segura de assinatura do documento <strong>{{ doc.titulo }}</strong>.</p>
+  <p><a class="btn primary full" href="{{ signing_url }}" rel="noreferrer noopener">Continuar para a assinatura</a></p>
+  <p class="muted small">Ao concluir, você voltará ao portal, onde o documento e o comprovante ficarão disponíveis.</p>
+  <p><a href="/documentos/{{ doc.id }}">← Voltar ao documento</a></p>
+</section>
+{% endblock %}

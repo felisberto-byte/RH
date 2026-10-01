@@ -98,26 +98,39 @@ def cmd_seed(_args) -> int:
 
 
 def cmd_import_employees(args) -> int:
-    from portal.web.routes_admin import parse_employees_csv, upsert_employees
+    from portal import audit
+    from portal.employees import (
+        EmployeeImportError,
+        decode_csv,
+        parse_employees_csv,
+        upsert_employees,
+    )
 
     raw = Path(args.csv).read_bytes()
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1")
     with _db().sessionmaker() as s:
-        n = upsert_employees(s, parse_employees_csv(text))
-        from portal import audit
-
+        try:
+            result = upsert_employees(s, parse_employees_csv(decode_csv(raw)))
+        except EmployeeImportError as exc:
+            print(f"Erro: {exc}", file=sys.stderr)
+            return 1
         audit.record(
             s,
             action="COLABORADORES_IMPORTADOS",
             actor_type="sistema",
             actor_ref="cli",
-            data={"arquivo": Path(args.csv).name, "registros": n, "sha256": audit.sha256_hex(raw)},
+            data={
+                "arquivo": Path(args.csv).name,
+                "criados": result.created,
+                "atualizados": result.updated,
+                "desativados": result.deactivated,
+                "sha256": audit.sha256_hex(raw),
+            },
         )
         s.commit()
-    print(f"{n} colaborador(es) importado(s)/atualizado(s).")
+    print(
+        f"{result.created} criado(s), {result.updated} atualizado(s), "
+        f"{len(result.deactivated)} desativado(s)."
+    )
     return 0
 
 

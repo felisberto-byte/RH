@@ -1,27 +1,34 @@
 {% extends "base.html" %}
-{% from "_macros.html" import status_badge %}
+{% from "_macros.html" import status_badge, status_label %}
 {% block title %}Documentos{% endblock %}
 {% block content %}
 <h1>Documentos</h1>
 {% include "admin/_nav.html" %}
-<form method="get" class="filters">
-  <select name="status"><option value="">Todas as situações</option>
-    {% for s in statuses %}<option value="{{ s }}" {{ "selected" if s == status }}>{{ s }}</option>{% endfor %}
+<form method="get" class="filters" aria-label="Filtros">
+  <label class="sr-only" for="f-status">Situação</label>
+  <select id="f-status" name="status"><option value="">Todas as situações</option>
+    {% for s in statuses %}<option value="{{ s }}" {{ "selected" if s == status }}>{{ status_label(s) }}</option>{% endfor %}
   </select>
-  <input name="matricula" value="{{ matricula }}" placeholder="Matrícula">
-  <input name="competencia" value="{{ competencia }}" placeholder="AAAA-MM">
+  <label class="sr-only" for="f-mat">Matrícula</label>
+  <input id="f-mat" name="matricula" value="{{ matricula }}" placeholder="Matrícula">
+  <label class="sr-only" for="f-comp">Competência</label>
+  <input id="f-comp" name="competencia" value="{{ competencia }}" placeholder="AAAA-MM" pattern="\d{4}-\d{2}">
   <button class="btn" type="submit">Filtrar</button>
 </form>
+<p class="muted small">Exibindo até 500 documentos, do mais recente para o mais antigo.</p>
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Colaborador</th><th>Documento</th><th>Competência</th><th>Situação</th><th>Emitido</th><th>Concluído</th><th></th></tr></thead>
+  <thead><tr><th>Colaborador</th><th>Documento</th><th>Competência</th><th>Situação</th><th>Emitido</th><th>Concluído</th><th>Ações</th></tr></thead>
   <tbody>
   {% for d in docs %}
   <tr>
     <td>{{ d.employee.nome }}<br><span class="muted small">{{ d.employee.matricula }}</span></td>
-    <td>{{ d.titulo }}<br><span class="muted small">{{ d.verification_code }}</span></td>
+    <td>{{ d.titulo }}<br><span class="muted small">{{ d.verification_code }}{% if d.engine == "docuseal" %} · DocuSeal{% endif %}</span></td>
     <td>{{ d.competencia or "—" }}</td>
-    <td>{{ status_badge(d.status) }}</td>
+    <td>{{ status_badge(d.status) }}
+      {% if d.status == "RECUSADO" and d.acceptance and d.acceptance.reason %}<br><span class="small">Motivo: {{ d.acceptance.reason }}</span>{% endif %}
+      {% if d.status == "CANCELADO" and d.cancel_reason %}<br><span class="small muted">Motivo: {{ d.cancel_reason }}</span>{% endif %}
+    </td>
     <td>{{ fmt_dt(d.created_at) }}</td>
     <td>{{ fmt_dt(d.completed_at) }}</td>
     <td class="actions">
@@ -30,7 +37,8 @@
       <details><summary>Cancelar</summary>
         <form method="post" action="/rh/documentos/{{ d.id }}/cancelar">
           <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
-          <input name="motivo" required minlength="5" placeholder="Motivo">
+          <label class="sr-only" for="motivo-{{ d.id }}">Motivo do cancelamento</label>
+          <input id="motivo-{{ d.id }}" name="motivo" required minlength="5" placeholder="Motivo">
           <button class="btn danger" type="submit">Confirmar</button>
         </form></details>
       {% endif %}

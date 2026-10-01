@@ -1,8 +1,9 @@
+{% set p = request.url.path %}
 <nav class="tabs" aria-label="RH">
-  <a href="/rh">Painel</a>
-  <a href="/rh/lotes/novo">Importar lote</a>
-  <a href="/rh/documentos">Documentos</a>
-  <a href="/rh/colaboradores">Colaboradores</a>
-  <a href="/rh/termo">Termo de adesão</a>
-  <a href="/rh/auditoria">Auditoria</a>
+  {% for href, label in [("/rh", "Painel"), ("/rh/lotes/novo", "Importar lote"), ("/rh/docuseal/emitir", "DocuSeal"),
+                         ("/rh/documentos", "Documentos"), ("/rh/colaboradores", "Colaboradores"), ("/rh/tipos", "Tipos"),
+                         ("/rh/termo", "Termo de adesão"), ("/rh/auditoria", "Auditoria")] %}
+  {% set on = p == href or (href != "/rh" and p.startswith(href)) %}
+  <a href="{{ href }}"{% if on %} class="active" aria-current="page"{% endif %}>{{ label }}</a>
+  {% endfor %}
 </nav>

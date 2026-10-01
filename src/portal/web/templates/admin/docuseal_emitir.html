@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Emitir via DocuSeal{% endblock %}
+{% block content %}
+<h1>Emitir documentos via DocuSeal</h1>
+{% include "admin/_nav.html" %}
+{% if not enabled %}
+<div class="alert error" role="alert">Integração com o DocuSeal desativada (<code>PORTAL_DOCUSEAL_URL</code> não configurado). As pendências podem ser criadas, mas o colaborador não conseguirá assiná-las até a integração ser ativada.</div>
+{% endif %}
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+{% if result %}
+<div class="alert ok" role="status">
+  {{ result["criados"]|length }} pendência(s) criada(s){% if result["criados"] %}: {{ result["criados"]|join(", ") }}{% endif %}.
+  {% if result["nao_encontrados"] %}<br>Não encontradas ou inativas: {{ result["nao_encontrados"]|join(", ") }}.{% endif %}
+</div>
+{% endif %}
+<section class="card">
+  <p class="muted small">Para documentos com campos variáveis preenchidos no DocuSeal (ex.: contratos de admissão). O colaborador vê a pendência em "Meus documentos" e o envio só é criado quando ele, autenticado no portal, abre o documento. Ao final, o PDF recebe o selo da empresa (e-CNPJ) e o comprovante do portal.</p>
+  {% if not types %}
+  <div class="alert error">Nenhum tipo com motor DocuSeal ativo. Cadastre um em <a href="/rh/tipos">Tipos</a> informando o id do template.</div>
+  {% else %}
+  <form method="post" action="/rh/docuseal/emitir">
+    <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+    <label for="tipo">Tipo (template)</label>
+    <select id="tipo" name="tipo" required>
+      {% for t in types %}<option value="{{ t.id }}">{{ t.nome }} (template {{ t.docuseal_template_id }})</option>{% endfor %}
+    </select>
+    <div class="grid2">
+      <div><label for="titulo">Título exibido ao colaborador</label>
+        <input id="titulo" name="titulo" maxlength="200" placeholder="ex.: Aditivo de jornada"></div>
+      <div><label for="competencia">Competência (opcional)</label>
+        <input id="competencia" name="competencia" type="month"></div>
+    </div>
+    <label for="matriculas">Matrículas (separadas por espaço, vírgula ou linha)</label>
+    <textarea id="matriculas" name="matriculas" rows="5" required></textarea>
+    <button class="btn primary" type="submit">Criar pendências</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

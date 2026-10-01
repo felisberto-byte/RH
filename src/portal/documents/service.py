@@ -5,22 +5,24 @@ from __future__ import annotations
 import io
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from portal import __version__, audit
 from portal.audit import canonical_json, sha256_hex
-from portal.auth.base import AuthProvider, Identity
+from portal.auth.base import AuthProvider, DirectoryUnavailable, Identity
 from portal.config import Settings
 from portal.db import utcnow
+from portal.locks import account_lock, recent_failures
 from portal.models import (
     Acceptance,
+    AuditEvent,
     Batch,
     DocStatus,
     Document,
@@ -28,23 +30,33 @@ from portal.models import (
     Employee,
     Engine,
     LoginAttempt,
+    new_uuid,
 )
 from portal.signing.anchors import resolve_placement
 from portal.signing.pades import Sealer, SealingError
 from portal.signing.receipt import ReceiptData, build_receipt_pdf
-from portal.storage import Storage
+from portal.storage import ObjectExistsError, Storage
 
 MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_PDF_PAGES = 200
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sem 0/O/1/I
 
 LEGAL_NOTE = (
-    "Aceite eletrônico realizado no Portal do Colaborador mediante autenticação com as "
-    "credenciais corporativas (Active Directory) e reautenticação no ato do aceite. "
-    "A integridade do documento é garantida pelo hash SHA-256 e pela assinatura digital "
-    "PAdES com certificado ICP-Brasil da empresa. Meio de comprovação de autoria e "
-    "integridade admitido pelas partes, nos termos do art. 10, § 2º, da MP nº 2.200-2/2001."
+    "Manifestação eletrônica realizada no Portal do Colaborador mediante autenticação com as "
+    "credenciais corporativas (Active Directory) e confirmação no ato. A integridade do "
+    "documento é garantida pelo hash SHA-256 e pela assinatura digital PAdES com certificado "
+    "ICP-Brasil da empresa. Meio de comprovação de autoria e integridade admitido pelas partes, "
+    "nos termos do art. 10, § 2º, da MP nº 2.200-2/2001."
 )
+
+# Texto exibido no formulário de divergência e registrado na evidência.
+REFUSAL_DECLARATION = "Registro divergência em relação a este documento pelo motivo que descrevo abaixo."
+
+KIND_LABELS = {
+    # natureza: (cabeçalho do carimbo, título do comprovante, rótulo da decisão)
+    "ciencia": ("CIÊNCIA ELETRÔNICA DO COLABORADOR", "Comprovante de Ciência Eletrônica", "CIÊNCIA"),
+    "aceite": ("ACEITE ELETRÔNICO DO COLABORADOR", "Comprovante de Aceite Eletrônico", "ACEITE"),
+}
 
 
 class DocumentError(Exception):
@@ -84,6 +96,21 @@ class Actor:
         return self.identity.username
 
 
+@dataclass
+class PreparedIssue:
+    """Resultado da fase 1 da emissão (validação + selo), sem gravar nada."""
+
+    employee: Employee
+    doc_type: DocumentType
+    pdf: bytes
+    sealed: bytes
+    original_sha256: str
+    sealed_sha256: str
+    anchor_source: str | None
+    titulo: str
+    competencia: str | None
+
+
 def new_verification_code() -> str:
     raw = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(12))
     return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
@@ -95,8 +122,8 @@ def mask_cpf(cpf: str | None) -> str | None:
     return f"***.{cpf[3:6]}.{cpf[6:9]}-**"
 
 
-def validate_pdf(data: bytes) -> int:
-    if len(data) > MAX_PDF_BYTES:
+def validate_pdf(data: bytes, max_bytes: int | None = MAX_PDF_BYTES) -> int:
+    if max_bytes is not None and len(data) > max_bytes:
         raise DocumentError("PDF maior que o limite de 20 MB.")
     if not data.startswith(b"%PDF-"):
         raise DocumentError("O arquivo enviado não é um PDF.")
@@ -107,7 +134,7 @@ def validate_pdf(data: bytes) -> int:
         pages = len(reader.pages)
     except PdfReadError as exc:
         raise DocumentError(f"PDF inválido: {exc}") from exc
-    if not 1 <= pages <= MAX_PDF_PAGES:
+    if pages < 1 or (max_bytes is not None and pages > MAX_PDF_PAGES):
         raise DocumentError(f"PDF deve ter entre 1 e {MAX_PDF_PAGES} páginas.")
     return pages
 
@@ -172,7 +199,9 @@ class DocumentService:
     def receipt_pdf(self, doc: Document) -> bytes:
         return self._read_verified(doc.receipt_key, doc.receipt_sha256, doc)
 
-    def mark_viewed(self, doc: Document, actor: Actor) -> None:
+    def mark_viewed(self, doc: Document, actor: Actor, *, mode: str = "inline", size: int = 0) -> None:
+        """Registra a abertura do PDF. ``mode``: "inline" (visualizador do portal)
+        ou "download". A evidência lista todas as aberturas antes da decisão."""
         first = doc.first_viewed_at is None
         if first:
             doc.first_viewed_at = utcnow()
@@ -184,12 +213,45 @@ class DocumentService:
             document_id=doc.id,
             ip=actor.ip,
             user_agent=actor.user_agent,
-            data={"primeira_visualizacao": first, "sha256": doc.final_sha256 or doc.sealed_sha256},
+            data={
+                "primeira_visualizacao": first,
+                "modo": mode if mode in ("inline", "download") else "inline",
+                "bytes": size,
+                "sha256": doc.final_sha256 or doc.sealed_sha256,
+            },
         )
         self.db.commit()
 
+    # ================================================================ storage
+    def _put(self, key: str, data: bytes) -> None:
+        """Gravação create-only e idempotente: se o objeto já existe com o MESMO
+        conteúdo (retentativa), segue; se o conteúdo difere, é erro."""
+        try:
+            self.storage.put(key, data)
+        except ObjectExistsError as exc:
+            if sha256_hex(self.storage.get(key)) != sha256_hex(data):
+                raise DocumentError(f"conflito no armazenamento ({key})") from exc
+
     # ================================================================ emissão
-    def issue(
+    def _find_duplicate(
+        self, employee_id: int, doc_type_id: int, competencia: str | None, original_sha: str
+    ) -> Document | None:
+        comp = (
+            Document.competencia.is_(None)
+            if competencia is None
+            else Document.competencia == competencia
+        )
+        return self.db.scalar(
+            select(Document).where(
+                Document.employee_id == employee_id,
+                Document.document_type_id == doc_type_id,
+                comp,
+                Document.original_sha256 == original_sha,
+                Document.status != DocStatus.CANCELADO,
+            )
+        )
+
+    def prepare_issue(
         self,
         *,
         employee: Employee,
@@ -197,27 +259,17 @@ class DocumentService:
         pdf: bytes,
         titulo: str,
         competencia: str | None,
-        created_by: str,
-        batch: Batch | None = None,
-    ) -> Document:
+    ) -> PreparedIssue:
+        """Fase 1 — valida e sela, SEM gravar nada nem manter travas (a chamada
+        à ACT pode demorar)."""
         if self.sealer is None:
             raise DocumentError("Certificado de assinatura (e-CNPJ) não configurado.")
         if doc_type.engine != Engine.NATIVO:
             raise DocumentError("Este tipo de documento é emitido pelo DocuSeal.")
         validate_pdf(pdf)
         original_sha = sha256_hex(pdf)
-        dup = self.db.scalar(
-            select(Document).where(
-                Document.employee_id == employee.id,
-                Document.document_type_id == doc_type.id,
-                Document.competencia == competencia,
-                Document.original_sha256 == original_sha,
-                Document.status != DocStatus.CANCELADO,
-            )
-        )
-        if dup is not None:
+        if self._find_duplicate(employee.id, doc_type.id, competencia, original_sha) is not None:
             raise DocumentError("Documento idêntico já emitido para este colaborador.")
-
         placement = None
         try:
             if doc_type.requires_acceptance:
@@ -230,27 +282,49 @@ class DocumentService:
             sealed = self.sealer.seal_issue(pdf, placement=placement)
         except (SealingError, ValueError) as exc:
             raise DocumentError(str(exc)) from exc
-        sealed_sha = sha256_hex(sealed)
+        return PreparedIssue(
+            employee=employee,
+            doc_type=doc_type,
+            pdf=pdf,
+            sealed=sealed,
+            original_sha256=original_sha,
+            sealed_sha256=sha256_hex(sealed),
+            anchor_source=placement.source if placement else None,
+            titulo=titulo[:200],
+            competencia=competencia,
+        )
 
+    def persist_issue(
+        self, p: PreparedIssue, *, created_by: str, batch: Batch | None = None
+    ) -> Document:
+        """Fase 2 — grava arquivos e registro (o chamador faz commit logo em seguida)."""
+        doc_type = p.doc_type
+        declaration = doc_type.declaration_text
         doc = Document(
-            employee_id=employee.id,
+            id=new_uuid(),  # definido já: compõe as chaves do armazenamento
+            employee_id=p.employee.id,
             document_type_id=doc_type.id,
             engine=Engine.NATIVO,
             batch_id=batch.id if batch else None,
-            titulo=titulo[:200],
-            competencia=competencia,
+            titulo=p.titulo,
+            competencia=p.competencia,
             status=DocStatus.PENDENTE if doc_type.requires_acceptance else DocStatus.DISPONIVEL,
+            declaration_text=declaration,
+            declaration_sha256=sha256_hex(declaration),
             verification_code=new_verification_code(),
-            original_sha256=original_sha,
-            sealed_sha256=sealed_sha,
+            original_sha256=p.original_sha256,
+            sealed_sha256=p.sealed_sha256,
             created_by=created_by,
         )
-        doc.original_key = f"documentos/{doc.id}/original-{original_sha[:16]}.pdf"
-        doc.sealed_key = f"documentos/{doc.id}/emitido-{sealed_sha[:16]}.pdf"
-        self.storage.put(doc.original_key, pdf)
-        self.storage.put(doc.sealed_key, sealed)
+        doc.original_key = f"documentos/{doc.id}/original-{p.original_sha256[:16]}.pdf"
+        doc.sealed_key = f"documentos/{doc.id}/emitido-{p.sealed_sha256[:16]}.pdf"
+        self._put(doc.original_key, p.pdf)
+        self._put(doc.sealed_key, p.sealed)
         self.db.add(doc)
-        self.db.flush()
+        try:
+            self.db.flush()
+        except IntegrityError as exc:  # emissão concorrente idêntica
+            raise DocumentError("Documento idêntico já emitido para este colaborador.") from exc
         audit.record(
             self.db,
             action="DOCUMENTO_EMITIDO",
@@ -258,63 +332,84 @@ class DocumentService:
             actor_ref=created_by,
             document_id=doc.id,
             data={
-                "colaborador_matricula": employee.matricula,
+                "colaborador_matricula": p.employee.matricula,
                 "tipo": doc_type.code,
-                "competencia": competencia,
-                "sha256_original": original_sha,
-                "sha256_emitido": sealed_sha,
-                "ancora": placement.source if placement else None,
+                "competencia": p.competencia,
+                "sha256_original": p.original_sha256,
+                "sha256_emitido": p.sealed_sha256,
+                "declaracao_sha256": doc.declaration_sha256,
+                "ancora": p.anchor_source,
                 "lote": batch.id if batch else None,
             },
         )
         return doc
 
-    # ========================================================= aceite/recusa
-    def _record_attempt(self, actor: Actor, ok: bool) -> None:
-        self.db.add(
-            LoginAttempt(
-                username=actor.identity.username.lower(), ip=actor.ip, success=ok, purpose="aceite"
-            )
+    def issue(
+        self,
+        *,
+        employee: Employee,
+        doc_type: DocumentType,
+        pdf: bytes,
+        titulo: str,
+        competencia: str | None,
+        created_by: str,
+        batch: Batch | None = None,
+    ) -> Document:
+        prepared = self.prepare_issue(
+            employee=employee, doc_type=doc_type, pdf=pdf, titulo=titulo, competencia=competencia
         )
-        if not ok:
-            self.db.commit()
+        return self.persist_issue(prepared, created_by=created_by, batch=batch)
 
-    def step_up(self, actor: Actor, password: str | None, otp: str | None) -> str:
-        """Confirmação no ato: senha do AD e, se habilitado, código TOTP."""
-        factors: list[str] = []
-        since = utcnow() - timedelta(minutes=self.s.login_lockout_minutes)
-        failures = (
-            self.db.scalar(
-                select(func.count(LoginAttempt.id)).where(
-                    LoginAttempt.username == actor.identity.username.lower(),
-                    LoginAttempt.success.is_(False),
-                    LoginAttempt.at >= since,
-                )
-            )
-            or 0
-        )
-        if failures >= self.s.login_max_failures:
-            raise DocumentError("Muitas tentativas. Aguarde alguns minutos.")
-        if self.s.accept_mfa == "totp":
+    # ========================================================= aceite/recusa
+    def _record_attempt(self, key: str, ip: str, ok: bool) -> None:
+        self.db.add(LoginAttempt(username=key, ip=ip, success=ok, purpose="aceite"))
+        self.db.commit()  # registra e libera a trava da conta
+
+    def step_up(
+        self, actor: Actor, password: str | None, otp: str | None, *, require_totp: bool = False
+    ) -> str:
+        """Confirmação no ato: senha do AD e, se exigido, código TOTP.
+
+        Serializada por conta (trava + contagem + bind + registro) e com commit
+        próprio: o consumo do código TOTP e a tentativa ficam registrados mesmo
+        que a etapa seguinte (selo) falhe.
+        """
+        key = actor.identity.username.lower()
+        need_totp = require_totp or self.s.accept_mfa == "totp"
+        totp = None
+        if need_totp:
             from portal.mfa import TotpService
 
             totp = TotpService(self.db, self.s.secret_key.get_secret_value(), self.s.totp_issuer)
             if actor.employee_id is None or not totp.is_enrolled(actor.employee_id):
                 raise MfaEnrollmentRequired("Configure o aplicativo autenticador antes de continuar.")
+        account_lock(self.db, key)
+        if recent_failures(self.db, key=key, minutes=self.s.login_lockout_minutes) >= (
+            self.s.login_max_failures
+        ):
+            self.db.rollback()
+            raise DocumentError("Muitas tentativas. Aguarde alguns minutos.")
+        factors: list[str] = []
         if self.s.accept_reauth == "password":
             if self.auth is None:
                 raise DocumentError("Provedor de autenticação indisponível.")
-            ok = bool(password) and self.auth.verify_password(actor.identity, password or "")
+            try:
+                ok = bool(password) and self.auth.verify_password(actor.identity, password or "")
+            except DirectoryUnavailable as exc:
+                self.db.rollback()
+                raise DocumentError(
+                    "Diretório indisponível no momento. Nada foi registrado; tente novamente."
+                ) from exc
             if not ok:
-                self._record_attempt(actor, False)
+                self._record_attempt(key, actor.ip, False)
                 raise DocumentError("Senha incorreta. Confirme com a mesma senha do computador.")
             factors.append("senha_ad")
-        if self.s.accept_mfa == "totp":
+        if totp is not None:
             if not totp.verify(actor.employee_id, otp or ""):  # type: ignore[arg-type]
-                self._record_attempt(actor, False)
+                self._record_attempt(key, actor.ip, False)
                 raise DocumentError("Código do autenticador inválido ou já utilizado.")
             factors.append("totp")
-        self._record_attempt(actor, True)
+        self._record_attempt(key, actor.ip, True)
         return "+".join(factors) or "sessao_ad"
 
     def adhesion(self, employee_id: int) -> dict | None:
@@ -335,8 +430,27 @@ class DocumentService:
             "versao": term.version,
             "sha256": term.sha256,
             "canal": acc.channel,
+            "registrado_por": acc.registered_by,
+            "objectGUID": acc.ad_object_guid,
+            "evidencia_sha256": acc.evidence_sha256,
             "aceito_em_utc": audit.iso_utc(acc.accepted_at),
         }
+
+    def _views(self, doc: Document) -> list[dict]:
+        events = self.db.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.document_id == doc.id, AuditEvent.action == "DOCUMENTO_VISUALIZADO")
+            .order_by(AuditEvent.id)
+        )
+        return [
+            {
+                "data_hora_utc": audit.iso_utc(ev.occurred_at),
+                "modo": (ev.data or {}).get("modo", "inline"),
+                "ip": ev.ip,
+                "usuario": ev.actor_ref,
+            }
+            for ev in events
+        ]
 
     def _evidence(
         self,
@@ -349,11 +463,15 @@ class DocumentService:
         reauth: str,
         at: datetime,
         adhesion: dict | None,
+        mfa: dict | None,
     ) -> dict:
         emp = doc.employee
+        views = self._views(doc)
+        first = doc.first_viewed_at
         return {
-            "versao": 1,
+            "versao": 2,
             "tipo": "manifestacao_eletronica",
+            "natureza": doc.document_type.manifestation_kind,
             "decisao": decision,
             "documento": {
                 "id": doc.id,
@@ -363,9 +481,11 @@ class DocumentService:
                 "codigo_verificacao": doc.verification_code,
                 "sha256_original": doc.original_sha256,
                 "sha256_apresentado": doc.sealed_sha256,
-                "primeira_visualizacao_utc": audit.iso_utc(doc.first_viewed_at)
-                if doc.first_viewed_at
+                "primeira_abertura_utc": audit.iso_utc(first) if first else None,
+                "segundos_entre_abertura_e_manifestacao": int((at - first).total_seconds())
+                if first
                 else None,
+                "aberturas": views,
             },
             "signatario": {
                 "nome": emp.nome,
@@ -381,7 +501,8 @@ class DocumentService:
             "autenticacao": {
                 "login": "Active Directory (LDAPS bind)",
                 "login_em_utc": audit.iso_utc(actor.login_at) if actor.login_at else None,
-                "reautenticacao_no_ato": reauth,
+                "confirmacao_no_ato": reauth,
+                "segundo_fator": mfa,
                 "sessao_ref": actor.session_ref,
             },
             "contexto": {
@@ -397,6 +518,9 @@ class DocumentService:
                 "data_hora_utc": audit.iso_utc(at),
                 "data_hora_local": at.astimezone(self.tz).isoformat(timespec="seconds"),
                 "fuso": self.s.timezone,
+                "fonte_de_tempo": "relógio do servidor (UTC) + carimbo do tempo da ACT na assinatura"
+                if self.s.tsa_url
+                else "relógio do servidor (UTC), SEM carimbo do tempo de terceiro",
             },
             "sistema": {
                 "portal_versao": __version__,
@@ -404,22 +528,33 @@ class DocumentService:
                 "empresa": self.s.company_name,
                 "cnpj": self.s.company_cnpj,
                 "certificado_selo": self.sealer.subject if self.sealer else None,
+                "act_carimbo_do_tempo": self.s.tsa_url or None,
             },
         }
 
-    def _lock_pending(self, doc_id: str, actor: Actor) -> Document:
-        doc = self.db.execute(
-            select(Document).where(Document.id == doc_id).with_for_update()
-        ).scalar_one_or_none()
+    def _check_pending(self, doc: Document | None, actor: Actor) -> Document:
         if doc is None or doc.employee_id != actor.employee_id:
             raise NotFound("Documento não encontrado.")
         if doc.status != DocStatus.PENDENTE:
-            raise DocumentError("Este documento não está pendente de aceite.")
+            raise DocumentError("Este documento não está pendente de manifestação.")
         if doc.engine != Engine.NATIVO:
             raise DocumentError("Este documento é assinado pelo fluxo DocuSeal.")
         if self.s.require_view_before_accept and doc.first_viewed_at is None:
             raise DocumentError("Abra e leia o documento antes de registrar sua decisão.")
         return doc
+
+    def _lock_pending(self, doc_id: str, actor: Actor) -> Document:
+        doc = self.db.execute(
+            select(Document)
+            .where(Document.id == doc_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+        return self._check_pending(doc, actor)
+
+    @staticmethod
+    def declaration_for(doc: Document) -> str:
+        return doc.declaration_text or doc.document_type.declaration_text
 
     def accept(
         self,
@@ -429,10 +564,19 @@ class DocumentService:
         declaration_confirmed: bool,
         password: str | None,
         otp: str | None = None,
+        declaration_sha256: str | None = None,
     ) -> Document:
         if not declaration_confirmed:
-            raise DocumentError("Marque a declaração para confirmar o aceite.")
-        return self._manifest(doc_id, actor, decision="ACEITO", reason=None, password=password, otp=otp)
+            raise DocumentError("Marque a declaração para confirmar.")
+        return self._manifest(
+            doc_id,
+            actor,
+            decision="ACEITO",
+            reason=None,
+            password=password,
+            otp=otp,
+            shown_declaration_sha256=declaration_sha256,
+        )
 
     def refuse(
         self, doc_id: str, actor: Actor, *, reason: str, password: str | None, otp: str | None = None
@@ -453,20 +597,33 @@ class DocumentService:
         reason: str | None,
         password: str | None,
         otp: str | None,
+        shown_declaration_sha256: str | None = None,
     ) -> Document:
         if self.sealer is None:
             raise DocumentError("Certificado de assinatura (e-CNPJ) não configurado.")
-        doc = self._lock_pending(doc_id, actor)
+        # 1) checagens sem trava, termo e confirmação (com commit próprio)
+        doc = self._check_pending(self.db.get(Document, doc_id), actor)
+        declaration = self.declaration_for(doc) if decision == "ACEITO" else REFUSAL_DECLARATION
+        if (
+            decision == "ACEITO"
+            and shown_declaration_sha256 is not None
+            and (shown_declaration_sha256 != sha256_hex(declaration))
+        ):
+            raise DocumentError("A declaração foi atualizada. Recarregue a página e leia novamente.")
         adhesion = self.adhesion(doc.employee_id)
-        reauth = self.step_up(actor, password, otp)
+        reauth = self.step_up(actor, password, otp, require_totp=doc.document_type.requires_totp)
+        mfa = None
+        if "totp" in reauth and actor.employee_id is not None:
+            from portal.mfa import TotpService
+
+            mfa = TotpService(self.db, self.s.secret_key.get_secret_value(), self.s.totp_issuer).info(
+                actor.employee_id
+            )
+        # 2) trava o documento e confere de novo (pode ter mudado no intervalo)
+        doc = self._lock_pending(doc_id, actor)
         sealed = self._read_verified(doc.sealed_key, doc.sealed_sha256, doc)
 
         at = utcnow()
-        declaration = (
-            doc.document_type.declaration_text
-            if decision == "ACEITO"
-            else ("Registro divergência em relação a este documento pelo motivo informado.")
-        )
         evidence = self._evidence(
             doc,
             actor,
@@ -476,84 +633,110 @@ class DocumentService:
             reauth=reauth,
             at=at,
             adhesion=adhesion,
+            mfa=mfa,
         )
         evidence_json = canonical_json(evidence)
         evidence_sha = sha256_hex(evidence_json)
         local = at.astimezone(self.tz)
         verify_url = f"{self.s.base_url.rstrip('/')}/verificar/{doc.verification_code}"
-
-        if decision == "ACEITO":
-            final = self.sealer.seal_acceptance(
-                sealed,
-                stamp_lines=[
-                    "ACEITE ELETRÔNICO DO COLABORADOR",
-                    f"{doc.employee.nome} · matrícula {doc.employee.matricula}",
-                    f"Usuário AD: {actor.identity.username}",
-                    f"{local:%d/%m/%Y %H:%M:%S} ({self.s.timezone}) · IP {actor.ip}",
-                    f"Documento SHA-256: {(doc.sealed_sha256 or '')[:24]}…",
-                    f"Evidência SHA-256: {evidence_sha[:24]}…",
-                    f"Verificar: {verify_url}",
-                ],
-                reason=f"Aceite eletrônico do colaborador; evidência SHA-256 {evidence_sha}",
-            )
-            final_sha = sha256_hex(final)
-            doc.final_key = f"documentos/{doc.id}/aceito-{final_sha[:16]}.pdf"
-            doc.final_sha256 = final_sha
-            self.storage.put(doc.final_key, final)
-
-        receipt_rows = [
-            ("Decisão", "ACEITE" if decision == "ACEITO" else "RECUSA / DIVERGÊNCIA"),
-            ("Documento", f"{doc.titulo} ({doc.document_type.nome})"),
-            ("Competência", doc.competencia or "—"),
-            ("ID do documento", doc.id),
-            ("Código de verificação", doc.verification_code),
-            ("SHA-256 do documento apresentado", doc.sealed_sha256 or ""),
-        ]
-        if doc.final_sha256:
-            receipt_rows.append(("SHA-256 do documento com aceite", doc.final_sha256))
-        receipt_rows += [
-            ("Colaborador", f"{doc.employee.nome} — matrícula {doc.employee.matricula}"),
-            ("CPF", mask_cpf(doc.employee.cpf) or "—"),
-            ("Usuário AD", f"{actor.identity.username} ({actor.identity.upn or '—'})"),
-            ("objectGUID (AD)", actor.identity.object_guid),
-            ("Data/hora", f"{local:%d/%m/%Y %H:%M:%S} ({self.s.timezone}) — {audit.iso_utc(at)} UTC"),
-            (
-                "Primeira visualização",
-                doc.first_viewed_at.astimezone(self.tz).strftime("%d/%m/%Y %H:%M:%S")
-                if doc.first_viewed_at
-                else "—",
-            ),
-            ("Endereço IP", actor.ip),
-            ("Navegador", actor.user_agent[:300]),
-            ("Autenticação", f"AD (LDAPS) + confirmação no ato: {reauth}"),
-            (
-                "Termo de adesão",
-                f"versão {adhesion['versao']} ({adhesion['canal']})" if adhesion else "—",
-            ),
-        ]
-        if reason:
-            receipt_rows.append(("Motivo informado", reason))
-        receipt = build_receipt_pdf(
-            ReceiptData(
-                company_name=self.s.company_name,
-                company_cnpj=self.s.company_cnpj,
-                title="Comprovante de Aceite Eletrônico"
-                if decision == "ACEITO"
-                else "Comprovante de Registro de Divergência",
-                rows=receipt_rows,
-                declaration=declaration,
-                evidence_sha256=evidence_sha,
-                verification_url=verify_url,
-                legal_note=LEGAL_NOTE,
-            ),
-            evidence_json,
-            document_pdf=sealed,
+        stamp_title, receipt_title, decision_label = KIND_LABELS.get(
+            doc.document_type.manifestation_kind, KIND_LABELS["aceite"]
         )
-        receipt = self.sealer.seal_receipt(receipt)
+
+        # 3) gera TODOS os arquivos antes de gravar qualquer coisa
+        final = None
+        try:
+            if decision == "ACEITO":
+                final = self.sealer.seal_acceptance(
+                    sealed,
+                    stamp_lines=[
+                        stamp_title,
+                        f"{doc.employee.nome} · matrícula {doc.employee.matricula}",
+                        f"Usuário AD: {actor.identity.username}",
+                        f"{local:%d/%m/%Y %H:%M:%S} ({self.s.timezone}) · IP {actor.ip}",
+                        f"Documento SHA-256: {(doc.sealed_sha256 or '')[:24]}...",
+                        f"Evidência SHA-256: {evidence_sha[:24]}...",
+                        f"Verificar: {verify_url}",
+                    ],
+                    reason=f"{decision_label.title()} eletrônica(o) do colaborador; evidência SHA-256 "
+                    f"{evidence_sha}",
+                )
+            final_sha = sha256_hex(final) if final else None
+            receipt_rows = [
+                ("Decisão", decision_label if decision == "ACEITO" else "DIVERGÊNCIA REGISTRADA"),
+                ("Documento", f"{doc.titulo} ({doc.document_type.nome})"),
+                ("Competência", doc.competencia or "—"),
+                ("ID do documento", doc.id),
+                ("Código de verificação", doc.verification_code),
+                ("SHA-256 do documento apresentado", doc.sealed_sha256 or ""),
+            ]
+            if final_sha:
+                receipt_rows.append(("SHA-256 do documento com o registro", final_sha))
+            receipt_rows += [
+                ("Colaborador", f"{doc.employee.nome} — matrícula {doc.employee.matricula}"),
+                ("CPF", mask_cpf(doc.employee.cpf) or "—"),
+                ("Usuário AD", f"{actor.identity.username} ({actor.identity.upn or '—'})"),
+                ("objectGUID (AD)", actor.identity.object_guid),
+                (
+                    "Data/hora",
+                    f"{local:%d/%m/%Y %H:%M:%S} ({self.s.timezone}) — {audit.iso_utc(at)} UTC",
+                ),
+                (
+                    "Primeira abertura do documento",
+                    doc.first_viewed_at.astimezone(self.tz).strftime("%d/%m/%Y %H:%M:%S")
+                    if doc.first_viewed_at
+                    else "—",
+                ),
+                ("Endereço IP", actor.ip),
+                ("Navegador", actor.user_agent[:300]),
+                ("Autenticação", f"AD (LDAPS) + confirmação no ato: {reauth}"),
+                (
+                    "Termo de adesão",
+                    f"versão {adhesion['versao']} ({adhesion['canal']})" if adhesion else "—",
+                ),
+                (
+                    "Carimbo do tempo",
+                    "ACT na assinatura" if self.s.tsa_url else "não utilizado (hora do servidor)",
+                ),
+            ]
+            if reason:
+                receipt_rows.append(("Motivo informado", reason))
+            receipt = build_receipt_pdf(
+                ReceiptData(
+                    company_name=self.s.company_name,
+                    company_cnpj=self.s.company_cnpj,
+                    title=receipt_title
+                    if decision == "ACEITO"
+                    else "Comprovante de Registro de Divergência",
+                    rows=receipt_rows,
+                    declaration=declaration,
+                    declaration_label="Declaração confirmada pelo colaborador"
+                    if decision == "ACEITO"
+                    else "Declaração de divergência registrada pelo colaborador",
+                    evidence_sha256=evidence_sha,
+                    verification_url=verify_url,
+                    legal_note=LEGAL_NOTE,
+                ),
+                evidence_json,
+                document_pdf=sealed,
+            )
+            receipt = self.sealer.seal_receipt(receipt)
+        except SealingError as exc:
+            self.db.rollback()
+            raise DocumentError(
+                "Não foi possível concluir agora (falha no selo/carimbo do tempo). "
+                "Nada foi registrado; tente novamente em instantes."
+            ) from exc
         receipt_sha = sha256_hex(receipt)
+
+        # 4) grava arquivos e, por fim, o registro
+        if final is not None and final_sha:
+            doc.final_key = f"documentos/{doc.id}/registrado-{final_sha[:16]}.pdf"
+            doc.final_sha256 = final_sha
+            self._put(doc.final_key, final)
         doc.receipt_key = f"documentos/{doc.id}/comprovante-{receipt_sha[:16]}.pdf"
         doc.receipt_sha256 = receipt_sha
-        self.storage.put(doc.receipt_key, receipt)
+        self._put(doc.receipt_key, receipt)
 
         self.db.add(
             Acceptance(
@@ -587,6 +770,7 @@ class DocumentService:
             ip=actor.ip,
             user_agent=actor.user_agent,
             data={
+                "natureza": doc.document_type.manifestation_kind,
                 "evidencia_sha256": evidence_sha,
                 "sha256_apresentado": doc.sealed_sha256,
                 "sha256_final": doc.final_sha256,
@@ -596,23 +780,30 @@ class DocumentService:
         )
         try:
             self.db.commit()
-        except IntegrityError as exc:  # aceite concorrente do mesmo documento
+        except IntegrityError as exc:  # manifestação concorrente do mesmo documento
             self.db.rollback()
             raise DocumentError("Este documento já possui manifestação registrada.") from exc
         return doc
 
     # ============================================================== RH
     def cancel(self, doc_id: str, *, actor_ref: str, reason: str, ip: str | None = None) -> Document:
-        doc = self.db.get(Document, doc_id)
-        if doc is None:
-            raise NotFound("Documento não encontrado.")
-        if doc.status in (DocStatus.ASSINADO, DocStatus.RECUSADO):
-            raise DocumentError(
-                "Documento com manifestação registrada não pode ser cancelado; emita um novo "
-                "documento retificador."
-            )
         if len((reason or "").strip()) < 5:
             raise DocumentError("Informe o motivo do cancelamento.")
+        # Trava e recarrega: um aceite em andamento pode concluir antes.
+        doc = self.db.execute(
+            select(Document)
+            .where(Document.id == doc_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+        if doc is None:
+            raise NotFound("Documento não encontrado.")
+        if doc.status not in (DocStatus.PENDENTE, DocStatus.DISPONIVEL):
+            self.db.rollback()
+            raise DocumentError(
+                "Documento com manifestação registrada (ou já cancelado) não pode ser cancelado; "
+                "emita um documento retificador."
+            )
         doc.status = DocStatus.CANCELADO
         doc.cancel_reason = reason.strip()[:1000]
         audit.record(

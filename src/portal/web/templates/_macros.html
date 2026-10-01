@@ -1,5 +1,6 @@
+{% set _STATUS_LABELS = {"PENDENTE": "Pendente", "DISPONIVEL": "Disponível", "ASSINADO": "Registrado",
+                         "RECUSADO": "Divergência registrada", "CANCELADO": "Cancelado"} %}
+{% macro status_label(status) -%}{{ _STATUS_LABELS.get(status, status) }}{%- endmacro %}
 {% macro status_badge(status) -%}
-{%- set labels = {"PENDENTE": "Pendente de aceite", "DISPONIVEL": "Disponível", "ASSINADO": "Aceito",
-                  "RECUSADO": "Divergência registrada", "CANCELADO": "Cancelado"} -%}
-<span class="badge badge-{{ status|lower }}">{{ labels.get(status, status) }}</span>
+<span class="badge badge-{{ status|lower }}">{{ _STATUS_LABELS.get(status, status) }}</span>
 {%- endmacro %}
