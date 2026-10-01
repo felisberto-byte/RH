@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge %}
+{% block title %}Área do RH{% endblock %}
+{% block content %}
+<h1>Área do RH</h1>
+{% include "admin/_nav.html" %}
+<div class="stats">
+  {% for st in ["PENDENTE", "ASSINADO", "RECUSADO", "DISPONIVEL", "CANCELADO"] %}
+  <a class="stat" href="/rh/documentos?status={{ st }}"><strong>{{ counts.get(st, 0) }}</strong>{{ status_badge(st) }}</a>
+  {% endfor %}
+</div>
+<div class="grid2">
+  <section class="card">
+    <h2>Últimos lotes</h2>
+    {% if not batches %}<p class="muted">Nenhum lote importado.</p>{% endif %}
+    <ul class="plain">
+      {% for b in batches %}
+      <li><a href="/rh/lotes/{{ b.id }}">#{{ b.id }} · {{ b.filename }}</a>
+        <span class="muted">{{ b.competencia or "" }} · {{ b.total_documents }} doc(s) · {{ fmt_dt(b.created_at) }}</span></li>
+      {% endfor %}
+    </ul>
+  </section>
+  <section class="card">
+    <h2>Pendências mais antigas</h2>
+    {% if not oldest_pending %}<p class="muted">Nenhuma pendência.</p>{% endif %}
+    <ul class="plain">
+      {% for d in oldest_pending %}
+      <li>{{ d.employee.nome }} — {{ d.titulo }} <span class="muted">desde {{ fmt_dt(d.created_at) }}</span></li>
+      {% endfor %}
+    </ul>
+  </section>
+</div>
+{% endblock %}

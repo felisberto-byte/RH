@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Lote #{{ batch.id }}{% endblock %}
+{% block content %}
+<h1>Lote #{{ batch.id }}</h1>
+{% include "admin/_nav.html" %}
+<section class="card">
+  <dl class="facts">
+    <dt>Arquivo</dt><dd>{{ batch.filename }}</dd>
+    <dt>SHA-256</dt><dd class="mono">{{ batch.source_sha256 }}</dd>
+    <dt>Tipo</dt><dd>{{ doc_type.nome if doc_type else "—" }}</dd>
+    <dt>Competência</dt><dd>{{ batch.competencia or "—" }}</dd>
+    <dt>Importado por</dt><dd>{{ batch.created_by }} em {{ fmt_dt(batch.created_at) }}</dd>
+    <dt>Documentos publicados</dt><dd>{{ batch.total_documents }}</dd>
+  </dl>
+</section>
+{% set rep = batch.report or {} %}
+{% if rep.get("erros") %}
+<section class="card">
+  <h2>Pendências da importação ({{ rep["erros"]|length }})</h2>
+  <table><thead><tr><th>Origem</th><th>Chave</th><th>Erro</th></tr></thead><tbody>
+  {% for e in rep["erros"] %}<tr><td>{{ e.get("origem") or e.get("arquivo") }}</td><td>{{ e.get("chave", "") }}</td><td>{{ e.get("erro") }}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+{% endif %}
+{% if rep.get("paginas_sem_identificacao") %}
+<div class="alert error">Páginas sem identificação no início do arquivo (não publicadas):
+  {% for p in rep["paginas_sem_identificacao"] %}{{ p + 1 }}{% if not loop.last %}, {% endif %}{% endfor %}.</div>
+{% endif %}
+{% endblock %}

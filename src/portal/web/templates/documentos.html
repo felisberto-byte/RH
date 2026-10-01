@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge %}
+{% block title %}Meus documentos{% endblock %}
+{% block content %}
+<h1>Meus documentos</h1>
+<nav class="tabs" aria-label="Filtro">
+  <a href="/documentos?aba=pendentes" class="{{ 'active' if aba != 'arquivados' }}">Pendentes ({{ pending|length }})</a>
+  <a href="/documentos?aba=arquivados" class="{{ 'active' if aba == 'arquivados' }}">Arquivados ({{ archived|length }})</a>
+</nav>
+{% set items = archived if aba == 'arquivados' else pending %}
+{% if not items %}
+  <p class="empty">{{ "Nenhum documento arquivado." if aba == 'arquivados' else "Você não tem documentos pendentes. 🎉" }}</p>
+{% else %}
+<ul class="doclist">
+  {% for d in items %}
+  <li>
+    <a href="/documentos/{{ d.id }}">
+      <strong>{{ d.titulo }}</strong>
+      <span class="muted">{{ d.document_type.nome }}{% if d.competencia %} · competência {{ d.competencia }}{% endif %}</span>
+      <span class="muted">Emitido em {{ fmt_dt(d.created_at) }}</span>
+    </a>
+    {{ status_badge(d.status) }}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

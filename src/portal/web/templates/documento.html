@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge %}
+{% block title %}{{ doc.titulo }}{% endblock %}
+{% block content %}
+<p><a href="/documentos">← Meus documentos</a></p>
+<div class="doc-head">
+  <div>
+    <h1>{{ doc.titulo }}</h1>
+    <p class="muted">{{ doc.document_type.nome }}{% if doc.competencia %} · competência {{ doc.competencia }}{% endif %}
+      · emitido em {{ fmt_dt(doc.created_at) }} · código {{ doc.verification_code }}</p>
+  </div>
+  {{ status_badge(doc.status) }}
+</div>
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+
+<div class="doc-layout">
+  <section class="viewer">
+    {% if doc.engine == "nativo" %}
+      <object data="/documentos/{{ doc.id }}/pdf" type="application/pdf" class="pdf">
+        <p>Seu navegador não exibe PDFs aqui.
+          <a href="/documentos/{{ doc.id }}/pdf?download=true">Baixe o documento</a> para ler.</p>
+      </object>
+      <p class="muted small"><a href="/documentos/{{ doc.id }}/pdf?download=true">Baixar PDF</a></p>
+    {% else %}
+      <div class="card"><p>Este documento é assinado em uma tela segura de assinatura (DocuSeal),
+        aberta a partir deste portal.</p></div>
+    {% endif %}
+  </section>
+
+  <aside class="panel">
+    {% if doc.status == "PENDENTE" and doc.engine == "nativo" %}
+      <h2>Aceite eletrônico</h2>
+      <form method="post" action="/documentos/{{ doc.id }}/aceite">
+        <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+        <label class="check"><input type="checkbox" name="declaracao" value="sim" required>
+          <span>{{ doc.document_type.declaration_text }}</span></label>
+        <label for="senha-aceite">Confirme sua senha do computador</label>
+        <input id="senha-aceite" name="senha" type="password" autocomplete="current-password"
+               {% if settings.accept_reauth == "password" %}required{% endif %}>
+        {% if settings.accept_mfa == "totp" %}
+        <label for="codigo-aceite">Código do aplicativo autenticador</label>
+        <input id="codigo-aceite" name="codigo" inputmode="numeric" autocomplete="one-time-code" required>
+        {% endif %}
+        <button class="btn primary full" type="submit">Registrar aceite</button>
+        <p class="muted small">Serão registrados: seu usuário, data/hora, endereço IP, navegador e o
+          código (hash) do documento. Você receberá um comprovante.</p>
+      </form>
+      <details class="refuse">
+        <summary>Não concordo / encontrei um erro</summary>
+        <form method="post" action="/documentos/{{ doc.id }}/recusa">
+          <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+          <label for="motivo">Descreva a divergência</label>
+          <textarea id="motivo" name="motivo" rows="4" minlength="10" maxlength="2000" required></textarea>
+          <label for="senha-recusa">Confirme sua senha</label>
+          <input id="senha-recusa" name="senha" type="password" autocomplete="current-password"
+                 {% if settings.accept_reauth == "password" %}required{% endif %}>
+          {% if settings.accept_mfa == "totp" %}
+          <label for="codigo-recusa">Código do aplicativo autenticador</label>
+          <input id="codigo-recusa" name="codigo" inputmode="numeric" autocomplete="one-time-code" required>
+          {% endif %}
+          <button class="btn danger full" type="submit">Registrar divergência</button>
+        </form>
+      </details>
+    {% elif doc.status == "PENDENTE" and doc.engine == "docuseal" %}
+      <h2>Assinatura</h2>
+      <form method="post" action="/documentos/{{ doc.id }}/docuseal">
+        <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+        {% if settings.accept_reauth == "password" %}
+        <label for="senha-ds">Confirme sua senha do computador</label>
+        <input id="senha-ds" name="senha" type="password" autocomplete="current-password" required>
+        {% endif %}
+        {% if settings.accept_mfa == "totp" %}
+        <label for="codigo-ds">Código do aplicativo autenticador</label>
+        <input id="codigo-ds" name="codigo" inputmode="numeric" autocomplete="one-time-code" required>
+        {% endif %}
+        <button class="btn primary full" type="submit">Abrir tela de assinatura</button>
+        <p class="muted small">O link é pessoal, vale por 2 horas e só é gerado após a confirmação.</p>
+      </form>
+    {% elif acceptance %}
+      <h2>{{ "Aceite registrado" if acceptance.decision == "ACEITO" else "Divergência registrada" }}</h2>
+      <dl class="facts">
+        <dt>Data/hora</dt><dd>{{ fmt_dt(acceptance.accepted_at) }}</dd>
+        <dt>Usuário</dt><dd>{{ acceptance.ad_username }}</dd>
+        <dt>IP</dt><dd>{{ acceptance.ip }}</dd>
+        {% if acceptance.reason %}<dt>Motivo</dt><dd>{{ acceptance.reason }}</dd>{% endif %}
+        <dt>Evidência</dt><dd class="mono">{{ acceptance.evidence_sha256[:32] }}…</dd>
+      </dl>
+      {% if doc.receipt_key %}
+      <a class="btn full" href="/documentos/{{ doc.id }}/comprovante">Baixar comprovante</a>
+      {% endif %}
+    {% else %}
+      <h2>Documento informativo</h2>
+      <p class="muted">Este documento não exige aceite.</p>
+    {% endif %}
+  </aside>
+</div>
+{% endblock %}

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Importar lote{% endblock %}
+{% block content %}
+<h1>Importar lote de documentos</h1>
+{% include "admin/_nav.html" %}
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+<section class="card">
+  <form method="post" action="/rh/lotes/novo" enctype="multipart/form-data">
+    <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+    <label for="tipo">Tipo de documento</label>
+    <select id="tipo" name="tipo" required>
+      {% for t in types %}<option value="{{ t.id }}">{{ t.nome }}{% if not t.requires_acceptance %} (sem aceite){% endif %}</option>{% endfor %}
+    </select>
+    <div class="grid2">
+      <div><label for="competencia">Competência</label>
+        <input id="competencia" name="competencia" type="month"></div>
+      <div><label for="titulo">Título exibido ao colaborador</label>
+        <input id="titulo" name="titulo" required placeholder="ex.: Holerite setembro/2026"></div>
+    </div>
+    <label for="arquivo">Arquivo do sistema de folha (PDF único com todos, ou ZIP com um PDF por colaborador)</label>
+    <input id="arquivo" name="arquivo" type="file" accept=".pdf,.zip,application/pdf,application/zip" required>
+    <details>
+      <summary>Opções avançadas de identificação</summary>
+      <label for="chave">Identificar colaborador por</label>
+      <select id="chave" name="chave"><option value="matricula">Matrícula</option><option value="cpf">CPF</option></select>
+      <label for="padrao">Expressão regular (grupo 1 = matrícula/CPF) aplicada ao texto de cada página</label>
+      <input id="padrao" name="padrao" value="{{ default_pattern }}" class="mono">
+      <p class="muted small">No ZIP, o nome de cada arquivo deve começar pela matrícula/CPF: <code>000123_holerite.pdf</code>.</p>
+    </details>
+    <button class="btn primary" type="submit">Importar, selar com e-CNPJ e publicar</button>
+  </form>
+</section>
+{% endblock %}

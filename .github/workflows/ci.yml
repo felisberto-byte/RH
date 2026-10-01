@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: portal
+          POSTGRES_USER: portal
+          POSTGRES_PASSWORD: portal
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U portal" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Lint e tipos
+        run: |
+          ruff check src tests migrations
+          ruff format --check src tests
+          mypy src
+      - name: Testes (SQLite)
+        run: pytest
+      - name: Migrações no PostgreSQL (upgrade/downgrade + gatilhos append-only)
+        env:
+          PORTAL_ENV: test
+          PORTAL_DATABASE_URL: postgresql+psycopg://portal:portal@localhost:5432/portal
+        run: |
+          alembic upgrade head
+          alembic check
+          python - <<'PY'
+          from sqlalchemy import create_engine, text
+          e = create_engine("postgresql+psycopg://portal:portal@localhost:5432/portal")
+          with e.begin() as c:
+              c.execute(text("INSERT INTO auditoria_cabeca (id, last_event_id, last_hash) VALUES (1, 0, repeat('0', 64))"))
+              c.execute(text("""INSERT INTO auditoria (occurred_at, actor_type, actor_ref, action, data, prev_hash, hash)
+                                VALUES (now(), 'sistema', 'ci', 'TESTE', '{}', repeat('0', 64), repeat('a', 64))"""))
+          try:
+              with e.begin() as c:
+                  c.execute(text("DELETE FROM auditoria"))
+              raise SystemExit("gatilho append-only não bloqueou DELETE")
+          except Exception as exc:
+              assert "append-only" in str(exc), exc
+              print("OK: auditoria é append-only")
+          PY
+          alembic downgrade base
+      - name: Testes (PostgreSQL)
+        env:
+          PORTAL_TEST_DATABASE_URL: postgresql+psycopg://portal:portal@localhost:5432/portal
+        run: pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t portal-colaborador:ci .

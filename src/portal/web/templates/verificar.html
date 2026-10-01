@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge %}
+{% block title %}Verificar documento{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Verificar autenticidade</h1>
+  {% if result %}
+    <div class="alert ok">Documento localizado na base do portal.</div>
+    <dl class="facts">
+      <dt>Código</dt><dd>{{ result.codigo }}</dd>
+      <dt>Tipo</dt><dd>{{ result.tipo }}</dd>
+      <dt>Título</dt><dd>{{ result.titulo }}</dd>
+      {% if result.competencia %}<dt>Competência</dt><dd>{{ result.competencia }}</dd>{% endif %}
+      <dt>Colaborador</dt><dd>{{ result.colaborador }}</dd>
+      <dt>Situação</dt><dd>{{ status_badge(result.status) }}</dd>
+      <dt>Emitido em</dt><dd>{{ fmt_dt(result.emitido_em) }}</dd>
+      {% if result.concluido_em %}<dt>Concluído em</dt><dd>{{ fmt_dt(result.concluido_em) }}</dd>{% endif %}
+      {% if result.sha256_emitido %}<dt>SHA-256 emitido</dt><dd class="mono">{{ result.sha256_emitido }}</dd>{% endif %}
+      {% if result.sha256_final %}<dt>SHA-256 com aceite</dt><dd class="mono">{{ result.sha256_final }}</dd>{% endif %}
+      {% if result.sha256_comprovante %}<dt>SHA-256 comprovante</dt><dd class="mono">{{ result.sha256_comprovante }}</dd>{% endif %}
+    </dl>
+    {% if uploaded_hash %}<p class="muted small">O arquivo enviado (SHA-256 {{ uploaded_hash }}) é idêntico a uma versão registrada.</p>{% endif %}
+    {% if signatures %}
+    <h2>Assinaturas digitais no arquivo</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Campo</th><th>Titular</th><th>Íntegra</th><th>Cadeia confiável</th><th>Carimbo do tempo</th></tr></thead>
+      <tbody>
+      {% for sig in signatures %}
+      <tr><td>{{ sig.campo }}</td><td class="small">{{ sig.titular }}</td>
+          <td>{{ "Sim" if sig.integra else "NÃO" }}</td>
+          <td>{{ "Sim" if sig.confiavel else "Não verificada" }}</td>
+          <td>{{ "Sim" if sig.carimbo_tempo else "Não" }}</td></tr>
+      {% endfor %}
+      </tbody></table></div>
+    {% endif %}
+  {% elif searched %}
+    <div class="alert error">Nenhum documento corresponde a este código ou arquivo.
+      {% if uploaded_hash %}<br><span class="mono small">SHA-256 do arquivo: {{ uploaded_hash }}</span>{% endif %}</div>
+  {% endif %}
+  {% if login_csrf %}
+  <form method="post" action="/verificar" enctype="multipart/form-data">
+    <input type="hidden" name="login_csrf" value="{{ login_csrf }}">
+    <label for="arquivo">Envie o PDF para comparar o hash</label>
+    <input id="arquivo" name="arquivo" type="file" accept="application/pdf" required>
+    <button class="btn primary full" type="submit">Verificar arquivo</button>
+  </form>
+  {% endif %}
+  <p class="muted small">Para validar as assinaturas digitais ICP-Brasil, use também o
+    Verificador de Conformidade do ITI (validar.iti.gov.br).</p>
+</section>
+{% endblock %}

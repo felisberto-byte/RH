@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Portal do Colaborador{% endblock %} · {{ settings.company_name }}</title>
+  <link rel="stylesheet" href="/static/css/portal.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="/">Portal do Colaborador <span>{{ settings.company_name }}</span></a>
+    {% if user %}
+    <nav class="nav">
+      {% if user.employee %}<a href="/documentos">Meus documentos</a>{% endif %}
+      {% if user.is_admin %}<a href="/rh">Área do RH</a>{% endif %}
+      <form method="post" action="/logout" class="inline">
+        <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+        <button class="link" type="submit">Sair ({{ user.identity.display_name }})</button>
+      </form>
+    </nav>
+    {% endif %}
+  </div>
+</header>
+<main class="wrap">
+  {% if flash %}<div class="alert ok" role="status">{{ flash }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+<footer class="wrap footer">
+  Documentos assinados digitalmente com certificado ICP-Brasil da empresa ·
+  <a href="/verificar">Verificar autenticidade</a>
+</footer>
+</body>
+</html>

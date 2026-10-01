@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Termo de adesão{% endblock %}
+{% block content %}
+<section class="card">
+  {% if not term %}
+    <h1>Termo de adesão</h1>
+    <p>Nenhum termo publicado. Procure o RH.</p>
+  {% else %}
+    <h1>Termo de Adesão ao Uso de Meios Eletrônicos</h1>
+    <p class="muted small">Versão {{ term.version }} · SHA-256 <span class="mono">{{ term.sha256 }}</span></p>
+    <div class="term-text">{{ term.text }}</div>
+    {% if accepted %}
+      <div class="alert ok">Você aceitou esta versão em {{ fmt_dt(accepted.accepted_at) }} ({{ accepted.channel }}).</div>
+    {% else %}
+      {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+      <form method="post" action="/termo" class="narrow-form">
+        <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+        <label class="check"><input type="checkbox" name="concordo" value="sim" required>
+          <span>Li e concordo com o Termo de Adesão acima.</span></label>
+        {% if settings.accept_reauth == "password" %}
+        <label for="senha">Confirme sua senha do computador</label>
+        <input id="senha" name="senha" type="password" autocomplete="current-password" required>
+        {% endif %}
+        <button class="btn primary" type="submit">Aceitar termo e continuar</button>
+      </form>
+      <p class="muted small">Prefere não aderir ao meio eletrônico? Procure o RH para receber seus documentos em papel.</p>
+    {% endif %}
+  {% endif %}
+</section>
+{% endblock %}

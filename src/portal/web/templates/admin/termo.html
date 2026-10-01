@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Termo de adesão{% endblock %}
+{% block content %}
+<h1>Termo de Adesão ao Uso de Meios Eletrônicos</h1>
+{% include "admin/_nav.html" %}
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+{% if term %}
+<section class="card">
+  <h2>Versão vigente: {{ term.version }}</h2>
+  <p class="muted small">Publicada por {{ term.published_by }} em {{ fmt_dt(term.published_at) }} · SHA-256 <span class="mono">{{ term.sha256 }}</span></p>
+  <div class="term-text">{{ term.text }}</div>
+</section>
+{% else %}
+<div class="alert error">Nenhum termo publicado: os colaboradores não conseguirão registrar aceites.</div>
+{% endif %}
+<section class="card">
+  <h2>Publicar nova versão</h2>
+  <p class="muted small">Ao publicar, todos os colaboradores precisarão aceitar a nova versão no próximo acesso. Valide o texto com o jurídico.</p>
+  <form method="post" action="/rh/termo">
+    <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+    <label for="versao">Versão</label>
+    <input id="versao" name="versao" required maxlength="20" placeholder="ex.: 2">
+    <label for="texto">Texto</label>
+    <textarea id="texto" name="texto" rows="18" required>{{ default_text }}</textarea>
+    <button class="btn primary" type="submit">Publicar</button>
+  </form>
+</section>
+{% endblock %}

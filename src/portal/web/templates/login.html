@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Entrar{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Entrar</h1>
+  <p class="muted">Use o mesmo usuário e senha do computador da empresa.</p>
+  {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+  <form method="post" action="/login" autocomplete="on">
+    <input type="hidden" name="login_csrf" value="{{ login_csrf }}">
+    <label for="username">Usuário</label>
+    <input id="username" name="username" autocomplete="username" required autofocus
+           placeholder="ex.: maria.silva">
+    <label for="password">Senha</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button class="btn primary full" type="submit">Entrar</button>
+  </form>
+</section>
+{% endblock %}

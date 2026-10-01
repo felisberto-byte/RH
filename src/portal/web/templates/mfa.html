@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Aplicativo autenticador{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Aplicativo autenticador</h1>
+  {% if enrolled %}
+    <div class="alert ok">Seu aplicativo autenticador está configurado.</div>
+    <p class="muted">Trocou de celular? Procure o RH/TI para redefinir.</p>
+  {% else %}
+    <p>Para confirmar seus aceites, use um aplicativo autenticador (Google Authenticator,
+      Microsoft Authenticator, FreeOTP etc.). Ele é pessoal: não compartilhe.</p>
+    <ol class="steps">
+      <li>No aplicativo, toque em <strong>adicionar conta</strong> e leia o QR code:</li>
+    </ol>
+    <div class="qr">{{ qr }}</div>
+    <p class="muted small">Sem câmera? Digite a chave: <span class="mono">{{ secret }}</span></p>
+    {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+    <form method="post" action="/mfa">
+      <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+      <label for="codigo">Código de 6 dígitos exibido no aplicativo</label>
+      <input id="codigo" name="codigo" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+      <button class="btn primary full" type="submit">Confirmar</button>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

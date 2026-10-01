@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portal-colaborador"
+version = "0.1.0"
+description = "Portal do Colaborador: documentos de DP com aceite eletrônico e selo PAdES (e-CNPJ)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "pydantic-settings>=2.4",
+    "sqlalchemy>=2.0.30",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+    "ldap3>=2.9",
+    "pyhanko[opentype]>=0.25",
+    "aiohttp>=3.9",
+    "pyhanko-certvalidator>=0.26",
+    "pypdf>=5.0",
+    "reportlab>=4.2",
+    "httpx>=0.27",
+    "cryptography>=43",
+    "pyotp>=2.9",
+    "qrcode>=7.4",
+]
+
+[project.optional-dependencies]
+gcp = ["google-cloud-storage>=2.18"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+portal = "portal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+portal = ["web/templates/**/*.html", "web/static/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 105
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE"]
+ignore = ["S101", "B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["portal", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S107", "S108", "S311"]
+"migrations/**" = ["E501", "UP", "I", "W291"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

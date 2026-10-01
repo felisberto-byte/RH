@@ -1,0 +1,55 @@
+# Ambiente LOCAL de desenvolvimento (não usar em produção).
+#   docker compose up --build            -> portal em http://localhost:8000
+#   docker compose --profile docuseal up -> + DocuSeal em http://localhost:3000
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: portal
+      POSTGRES_USER: portal
+      POSTGRES_PASSWORD: portal-dev
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal"]
+      interval: 5s
+      retries: 10
+
+  portal:
+    build: .
+    depends_on:
+      db: {condition: service_healthy}
+    ports: ["8000:8080"]
+    environment:
+      PORTAL_ENV: dev
+      PORTAL_BASE_URL: http://localhost:8000
+      PORTAL_SECRET_KEY: dev-dev-dev-dev-dev-dev-dev-dev-dev-dev
+      PORTAL_COMPANY_NAME: Empresa Exemplo Ltda
+      PORTAL_COMPANY_CNPJ: 00.000.000/0001-00
+      PORTAL_DATABASE_URL: postgresql+psycopg://portal:portal-dev@db/portal
+      PORTAL_STORAGE_BACKEND: local
+      PORTAL_STORAGE_LOCAL_PATH: /app/var/storage
+      PORTAL_AUTH_PROVIDER: dev
+      PORTAL_SIGNING_PFX_FILE: /app/var/dev/dev-ecnpj.pfx
+      PORTAL_SIGNING_PFX_PASSWORD: dev
+      PORTAL_SIGNING_CA_CHAIN_FILES: '["/app/var/dev/dev-ca.pem"]'
+    volumes: [portalvar:/app/var]
+    command: >
+      sh -c "portal dev-cert /app/var/dev --senha dev >/dev/null 2>&1 || true;
+             alembic upgrade head && portal seed &&
+             exec uvicorn portal.web.asgi:app --host 0.0.0.0 --port 8080"
+
+  docuseal:
+    profiles: ["docuseal"]
+    image: docuseal/docuseal:latest
+    depends_on:
+      db: {condition: service_healthy}
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgresql://portal:portal-dev@db/docuseal
+      SECRET_KEY_BASE: dev-only-change-me
+    volumes: [docuseal:/data/docuseal]
+
+volumes:
+  pgdata: {}
+  portalvar: {}
+  docuseal: {}

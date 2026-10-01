@@ -1,0 +1,22 @@
+project_id   = "empresa-portal-prod"
+image        = "southamerica-east1-docker.pkg.dev/empresa-portal-prod/portal/portal:0.1.0"
+domain       = "portal.empresa.com.br"
+company_name = "Empresa Exemplo Ltda"
+company_cnpj = "00.000.000/0001-00"
+
+onprem_cidrs = ["192.168.0.0/16"]
+dc_ips       = ["192.168.10.10", "192.168.10.11"]
+vpn_peer_ip  = "200.200.200.200" # IP público do firewall da empresa
+# vpn_shared_secret: export TF_VAR_vpn_shared_secret=...
+
+ad_dns_domain  = "empresa.local."
+dc_dns_records = { "dc01" = "192.168.10.10", "dc02" = "192.168.10.11" }
+
+ldap_url            = "ldaps://dc01.empresa.local:636"
+ldap_bind_dn        = "CN=svc-portal,OU=Servicos,DC=empresa,DC=local"
+ldap_base_dn        = "OU=Usuarios,DC=empresa,DC=local"
+ldap_group_users_dn = "CN=GG_Portal_Colaboradores,OU=Grupos,DC=empresa,DC=local"
+ldap_group_admin_dn = "CN=GG_Portal_RH,OU=Grupos,DC=empresa,DC=local"
+
+accept_mfa = "totp"
+# tsa_url  = "https://act.exemplo.com.br/tsa"   # ACT ICP-Brasil contratada

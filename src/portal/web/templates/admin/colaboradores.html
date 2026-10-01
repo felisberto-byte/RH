@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Colaboradores{% endblock %}
+{% block content %}
+<h1>Colaboradores</h1>
+{% include "admin/_nav.html" %}
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+<section class="card">
+  <h2>Importar/atualizar (CSV)</h2>
+  <p class="muted small">Cabeçalho: <code>matricula;nome;cpf;email;ativo</code>. A matrícula deve ser igual ao atributo do AD configurado em <code>PORTAL_LDAP_EMPLOYEE_ID_ATTR</code> (padrão <code>employeeNumber</code>).</p>
+  <form method="post" action="/rh/colaboradores/importar" enctype="multipart/form-data" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+    <input name="arquivo" type="file" accept=".csv,text/csv" required>
+    <button class="btn primary" type="submit">Importar</button>
+  </form>
+</section>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Matrícula</th><th>Nome</th><th>E-mail</th><th>Usuário AD</th><th>Situação</th><th></th></tr></thead>
+  <tbody>
+  {% for e in employees %}
+  <tr><td>{{ e.matricula }}</td><td>{{ e.nome }}</td><td>{{ e.email or "—" }}</td>
+      <td>{{ e.ad_username or "não vinculado" }}</td><td>{{ "Ativo" if e.ativo else "Inativo" }}</td>
+      <td class="actions">
+        <a href="/rh/colaboradores/{{ e.id }}/pacote">Pacote de documentos</a>
+        <details><summary>Termo em papel/gov.br</summary>
+          <form method="post" action="/rh/colaboradores/{{ e.id }}/termo-externo">
+            <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+            <select name="canal"><option value="papel">Papel</option><option value="govbr">gov.br</option></select>
+            <input name="observacao" required minlength="5" placeholder="Onde está arquivado">
+            <button class="btn" type="submit">Registrar</button>
+          </form></details>
+        <details><summary>Redefinir autenticador</summary>
+          <form method="post" action="/rh/colaboradores/{{ e.id }}/mfa-redefinir">
+            <input type="hidden" name="csrf" value="{{ user.session.csrf_token }}">
+            <input name="motivo" required minlength="5" placeholder="Motivo (ex.: troca de celular)">
+            <button class="btn danger" type="submit">Redefinir</button>
+          </form></details>
+      </td></tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">Nenhum colaborador cadastrado.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

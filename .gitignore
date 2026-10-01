@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Configuração local e segredos — NUNCA versionar
+.env
+*.pfx
+*.p12
+*.pem
+*.key
+!tests/fixtures/*.pem
+secrets/
+
+# Dados locais
+var/
+*.sqlite3
+*.db
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/*.tfstate*
+infra/terraform/*.tfvars
+!infra/terraform/*.tfvars.example

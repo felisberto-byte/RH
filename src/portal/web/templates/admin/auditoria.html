@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Auditoria{% endblock %}
+{% block content %}
+<h1>Trilha de auditoria</h1>
+{% include "admin/_nav.html" %}
+{% if report.ok %}
+<div class="alert ok">Cadeia íntegra: {{ report.checked }} eventos verificados. Hash atual: <span class="mono small">{{ report.head_hash }}</span></div>
+{% else %}
+<div class="alert error">Cadeia QUEBRADA no evento {{ report.first_bad_id }}: {{ report.reason }}. Acione a TI/segurança.</div>
+{% endif %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>#</th><th>Data/hora</th><th>Ação</th><th>Ator</th><th>Documento</th><th>IP</th></tr></thead>
+  <tbody>
+  {% for e in events %}
+  <tr><td>{{ e.id }}</td><td>{{ fmt_dt(e.occurred_at) }}</td><td>{{ e.action }}</td>
+      <td>{{ e.actor_type }}:{{ e.actor_ref }}</td><td class="mono small">{{ (e.document_id or "")[:8] }}</td><td>{{ e.ip or "" }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
