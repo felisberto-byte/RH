@@ -1,6 +1,6 @@
 # ADR 0004 — LDAPS direto agora; Keycloak/OIDC como alvo
 
-**Situação:** aceita · **Data:** 2026-10-01
+**Situação:** aceita, com atualização ao final · **Data:** 2026-10-01
 
 ## Contexto
 
@@ -43,3 +43,32 @@ Observações técnicas:
   de RH/TI deve garantir uma conta pessoal por colaborador.
 - A TI pode redefinir senhas, e por isso o TOTP sob controle do colaborador é
   recomendado em produção.
+
+## Atualização (revisão adversarial)
+
+A opção A continua no MVP. Mudanças no login e na sessão (detalhes em
+`docs/integracao-ad.md`):
+
+- **Bind primeiro:** a conta de serviço localiza o DN, e o *bind* do usuário vem antes
+  de qualquer checagem da conta. Usuário inexistente, senha errada e os subcódigos que
+  o AD devolve mesmo com senha errada (775 bloqueio, 533 desabilitada, 701 expirada,
+  530/531 restrições) recebem a mesma mensagem genérica; o subcódigo vai só para o log. "Conta desabilitada" e "sem acesso ao portal" só aparecem depois
+  da senha correta, o que impede enumerar contas.
+- **Limite por conta canônica:** o contador usa a conta sem `DOMINIO\` e sem `@sufixo`,
+  em minúsculas, e é serializado por trava consultiva (`pg_advisory_xact_lock`).
+  Variações digitadas e requisições paralelas não somam binds errados no AD. A
+  confirmação no ato (aceite, termo, cadastro do TOTP) usa a mesma trava e o mesmo
+  limite. Há também um limite por IP, só para falhas de login
+  (`PORTAL_LOGIN_MAX_FAILURES_PER_IP`, padrão 50 por causa do NAT).
+- **Revalidação:** a cada `PORTAL_SESSION_REVALIDATE_MINUTES` (padrão 10) a conta é
+  consultada no AD. Conta desabilitada, fora do grupo, cadastro inativo ou vínculo
+  divergente revogam a sessão (`SESSAO_REVOGADA`). Se o AD estiver indisponível, a
+  sessão continua.
+- **Vínculo por objectGUID:** outra conta ou matrícula diferente no AD bloqueiam o acesso
+  (`VINCULO_AD_CONFLITO`/`VINCULO_AD_DIVERGENTE`). Na readmissão com nova conta, o RH usa
+  "Desvincular conta do AD" (`VINCULO_AD_REMOVIDO`).
+- **TOTP:** além de `PORTAL_ACCEPT_MFA=totp` (todos os documentos), cada tipo pode exigir
+  TOTP. Cadastrar o autenticador exige a senha do AD no ato. O código é de uso único,
+  com consumo atômico. A tela mostra desde quando está configurado. O RH pode redefini-lo
+  (`MFA_REDEFINIDO`, sessões revogadas), e a evidência registra a configuração e as
+  redefinições.

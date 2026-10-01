@@ -1,6 +1,6 @@
 # ADR 0005 — Evidência canônica, trilha encadeada por hash e ancoragem
 
-**Situação:** aceita · **Data:** 2026-10-01
+**Situação:** aceita, com atualização ao final · **Data:** 2026-10-01
 
 ## Contexto
 
@@ -43,3 +43,37 @@ em produção**.
 - Alterar o banco diretamente quebra a cadeia, o que é detectável. Remover eventos
   recentes depois da última âncora é detectável pela comparação com a cabeça ancorada.
 - O IP é dado pessoal (LGPD). A retenção da trilha segue a do documento.
+
+## Atualização (revisão adversarial)
+
+- **Âncoras verificadas:** o token RFC 3161 cobre
+  `SHA-256("portal-auditoria:<evento>:<hash>")` da cabeça. `portal verify-audit` (job
+  diário) confere a cadeia inteira e cada âncora: o evento ancorado mantém o hash, o
+  token está íntegro e o *imprint* é igual ao hash carimbado. Uma cadeia reescrita de
+  forma "consistente" falha nessa conferência. Em falha, o comando registra
+  `CADEIA DE AUDITORIA COM FALHA` (severity ERROR, com alerta) e sai com código 1. A tela
+  do RH faz a verificação incremental a partir da última âncora.
+- **Dossiê autossuficiente:** inclui todas as versões do PDF (com adicionais e trilha do
+  DocuSeal), `evidencia.json`, o segmento contínuo da cadeia, os tokens `.tsr`, o texto
+  do termo referenciado, `manifesto.json` e `verificar.py`. O script usa só a biblioteca
+  padrão do Python, confere hashes, encadeamento e *imprint* das âncoras e sai com 0
+  quando o dossiê está ÍNTEGRO. Lista de arquivos em `docs/arquitetura.md`.
+- **Gatilhos** também bloqueiam TRUNCATE nas tabelas somente-inclusão. `auditoria_cabeca`
+  só avança, sem recuar nem ser apagada (a migração semeia a cabeça). O termo de adesão
+  publicado é imutável, exceto `active`.
+- **Papéis:** `portal_owner` é o dono do esquema e só o job de migração o usa. A
+  aplicação conecta como `portal_app` (`portal db-app-role`, sem superusuário), com
+  SELECT/INSERT nas tabelas somente-inclusão, SELECT/INSERT/UPDATE em
+  `auditoria_cabeca` e `termos_adesao` e CRUD nas demais. Assim ela não remove gatilhos
+  nem tabelas. Um teste no PostgreSQL real cobre esquema, gatilhos e privilégios.
+- **Evidência v2:** registra a natureza (ciência/aceite) e a declaração fotografada na
+  emissão (texto e SHA-256, conferido contra o hash da declaração exibida). Registra
+  também as aberturas do documento, o histórico do TOTP (quando usado) e a fonte de
+  tempo, inclusive quando a produção opera sem ACT (`PORTAL_ALLOW_NO_TSA=true`). Na
+  divergência, guarda a frase fixa de recusa e o motivo.
+- **Termo de adesão:** o aceite pelo portal gera comprovante PDF selado com o texto
+  integral e a evidência embutida. O RH só registra adesões externas, pelos canais
+  "papel" e "gov.br".
+- **LGPD:** `portal purge --dias N` (mínimo 30) apaga tentativas de login e sessões
+  encerradas antigas (`DADOS_OPERACIONAIS_EXPURGADOS`). Documentos, aceites e auditoria
+  nunca são apagados.

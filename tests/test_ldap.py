@@ -8,7 +8,6 @@ import pytest
 
 from portal.auth.base import AuthError, DirectoryUnavailable
 from portal.auth.ldap import (
-    BLOCKED_ERROR,
     GENERIC_ERROR,
     LdapAuthProvider,
     bind_error_message,
@@ -129,10 +128,13 @@ def test_empty_password_never_reaches_ad(provider, directory):
 def test_wrong_password_and_locked_are_generic(provider, directory):
     with pytest.raises(AuthError, match=GENERIC_ERROR):
         provider.authenticate("maria.silva", "errada")
-    directory.bind_code = "775"
-    with pytest.raises(AuthError) as exc:
-        provider.authenticate("maria.silva", "errada")
-    assert str(exc.value) == BLOCKED_ERROR
+    # bloqueada/desabilitada/expirada: o AD responde assim mesmo com senha
+    # errada; a mensagem é igual à de senha errada (sem enumeração)
+    for code in ("775", "533", "530", "701", "52e", "525"):
+        directory.bind_code = code
+        with pytest.raises(AuthError) as exc:
+            provider.authenticate("maria.silva", "errada")
+        assert str(exc.value) == GENERIC_ERROR, code
 
 
 def test_disabled_account_and_group_membership(provider, directory):

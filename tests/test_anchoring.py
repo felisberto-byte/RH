@@ -104,3 +104,64 @@ def test_head_lock_refreshes_stale_identity_map(database):
         audit.record(s2, action="C", actor_type="sistema", actor_ref="t")
         s2.commit()
         assert audit.verify_chain(s2).ok
+
+
+def test_dossier_segment_reaches_anchor_after_late_acceptance(session, storage, tmp_path):
+    """Âncora diária ENTRE a emissão e o aceite: o segmento do dossiê precisa ir
+    até a âncora que cobre o último evento do documento (o aceite)."""
+    import io
+    import json
+    import subprocess
+    import sys
+    import zipfile
+
+    from portal.dossier import build_dossier
+    from portal.models import Document, DocumentType, Employee
+
+    emp = Employee(matricula="1", nome="Ana Lima")
+    tipo = DocumentType(code="T", nome="Tipo", declaration_text="Declaro.")
+    session.add_all([emp, tipo])
+    session.flush()
+    doc = Document(
+        id="d" * 36,
+        employee_id=emp.id,
+        document_type_id=tipo.id,
+        titulo="Doc",
+        status="PENDENTE",
+        verification_code="AAAA-BBBB-CCCC",
+        created_by="rh",
+    )
+    session.add(doc)
+    audit.record(
+        session, action="DOCUMENTO_EMITIDO", actor_type="rh", actor_ref="rh", document_id=doc.id
+    )
+    session.commit()
+    tsa = _tsa()
+    early = anchor_audit(session, storage, tsa, "https://tsa.example")  # cobre só a emissão
+    audit.record(session, action="OUTRO", actor_type="sistema", actor_ref="x")
+    accepted = audit.record(
+        session, action="DOCUMENTO_ACEITO", actor_type="colaborador", actor_ref="ana", document_id=doc.id
+    )
+    session.commit()
+    late = anchor_audit(session, storage, tsa, "https://tsa.example")
+    assert early.head_event_id < accepted.id <= late.head_event_id
+
+    data, manifest = build_dossier(session, storage, doc)
+    assert manifest["ancoras"][0]["evento"] == late.head_event_id
+    assert manifest["segmento_auditoria"]["ultimo_evento"] == late.head_event_id
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        zf.extractall(tmp_path)
+    out = subprocess.run(
+        [sys.executable, "verificar.py"], cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+    assert out.returncode == 0 and "todos os eventos do documento" in out.stdout, out.stdout
+    # segmento cortado antes do aceite é detectado
+    seg = (tmp_path / "auditoria" / "segmento.jsonl").read_text(encoding="utf-8").splitlines()
+    (tmp_path / "auditoria" / "segmento.jsonl").write_text("\n".join(seg[:1]), encoding="utf-8")
+    out = subprocess.run(
+        [sys.executable, "verificar.py"], cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+    assert out.returncode == 1 and "fora do segmento" in out.stdout
+    assert (
+        json.loads((tmp_path / "manifesto.json").read_text())["segmento_auditoria"]["truncado"] is False
+    )

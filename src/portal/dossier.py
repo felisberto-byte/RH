@@ -88,30 +88,45 @@ for line in lines:
         ok = False; print("FALHA hash do evento", e["id"])
     prev = e["hash"]
 print(f"Trilha: {len(lines)} eventos verificados")
+seg = [json.loads(line) for line in lines]
+ids = {e["id"] for e in seg}
+missing = [i for i in man.get("eventos_do_documento", []) if i not in ids]
+if missing:
+    ok = False; print("FALHA eventos do documento fora do segmento:", missing)
+else:
+    print("OK  todos os eventos do documento estão no segmento")
+if man.get("segmento_auditoria", {}).get("truncado"):
+    print("ATENÇÃO segmento truncado: confira a trilha completa no portal")
 for a in man.get("ancoras", []):
     imprint = hashlib.sha256(f"portal-auditoria:{a['evento']}:{a['hash']}".encode()).hexdigest()
     tsr = (base / a["arquivo"]).read_bytes()
     good = bytes.fromhex(imprint) in tsr
+    # o segmento deve terminar exatamente no evento carimbado, com o mesmo hash
+    good &= bool(seg) and seg[-1]["id"] == a["evento"] and seg[-1]["hash"] == a["hash"]
     ok &= good
-    print(("OK  " if good else "FALHA ") + f"âncora do evento {a['evento']} (imprint no token)")
+    print(("OK  " if good else "FALHA ") + f"âncora do evento {a['evento']} (imprint e fim do segmento)")
+if not man.get("ancoras"):
+    print("ATENÇÃO sem âncora cobrindo o documento ainda (exporte após a próxima ancoragem diária)")
 print("RESULTADO:", "ÍNTEGRO" if ok else "DIVERGÊNCIAS ENCONTRADAS")
 sys.exit(0 if ok else 1)
 '''
 
 
-def _segment(db: Session, first_id: int) -> tuple[list[AuditEvent], AuditAnchor | None]:
-    """Eventos contínuos de ``first_id`` até a primeira âncora que os cobre."""
-    last_doc_event = first_id
+def _segment(db: Session, first_id: int, last_id: int) -> tuple[list[AuditEvent], AuditAnchor | None]:
+    """Eventos CONTÍNUOS do primeiro evento do documento até a primeira âncora
+    que cobre o ÚLTIMO evento dele (ou até a cabeça atual, se ainda não houver
+    âncora). Assim todos os eventos do documento ficam dentro do segmento e o
+    segmento termina exatamente no evento carimbado."""
     anchor = db.scalar(
         select(AuditAnchor)
-        .where(AuditAnchor.head_event_id >= last_doc_event)
+        .where(AuditAnchor.head_event_id >= last_id)
         .order_by(AuditAnchor.head_event_id)
+        .limit(1)
     )
-    upper = anchor.head_event_id if anchor else None
     q = select(AuditEvent).where(AuditEvent.id >= first_id).order_by(AuditEvent.id)
-    if upper is not None:
-        q = q.where(AuditEvent.id <= upper)
-    events = list(db.scalars(q.limit(MAX_SEGMENT_EVENTS)))
+    if anchor is not None:
+        q = q.where(AuditEvent.id <= anchor.head_event_id)
+    events = list(db.scalars(q.limit(MAX_SEGMENT_EVENTS + 1)))
     return events, anchor
 
 
@@ -121,14 +136,12 @@ def build_dossier(db: Session, storage: Storage, doc: Document) -> tuple[bytes, 
     ).all()
     first_id = doc_events[0].id if doc_events else 0
     last_doc_id = doc_events[-1].id if doc_events else 0
-    segment, _ = _segment(db, first_id) if first_id else ([], None)
-    # âncoras que cobrem o último evento do documento
-    anchors = db.scalars(
-        select(AuditAnchor)
-        .where(AuditAnchor.head_event_id >= last_doc_id)
-        .order_by(AuditAnchor.head_event_id)
-        .limit(1)
-    ).all()
+    segment, anchor = _segment(db, first_id, last_doc_id) if first_id else ([], None)
+    truncated = len(segment) > MAX_SEGMENT_EVENTS
+    if truncated:
+        # Segmento longo demais: a âncora não é alcançada; o manifesto registra.
+        segment, anchor = segment[:MAX_SEGMENT_EVENTS], None
+    anchors = [anchor] if anchor is not None else []
 
     files: dict[str, dict] = {}
     manifest: dict = {
@@ -141,7 +154,7 @@ def build_dossier(db: Session, storage: Storage, doc: Document) -> tuple[bytes, 
             "primeiro_evento": segment[0].id if segment else None,
             "ultimo_evento": segment[-1].id if segment else None,
             "hash_anterior_inicial": segment[0].prev_hash if segment else GENESIS,
-            "truncado": len(segment) >= MAX_SEGMENT_EVENTS,
+            "truncado": truncated,
         },
         "ancoras": [],
     }

@@ -27,23 +27,22 @@ log = logging.getLogger(__name__)
 UAC_ACCOUNTDISABLE = 0x0002
 MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"
 
-GENERIC_ERROR = "Usuário ou senha inválidos."
+# Mensagem ÚNICA para qualquer falha que não prove a senha: usuário inexistente,
+# senha errada, conta bloqueada/desabilitada/expirada. Inclui a dica do bloqueio
+# para quem tem certeza da senha, sem revelar o estado de nenhuma conta.
+GENERIC_ERROR = (
+    "Usuário ou senha inválidos. Se tem certeza da senha, sua conta pode estar bloqueada: procure a TI."
+)
+# Só exibida DEPOIS de a senha ser comprovada (conta desabilitada no AD).
 BLOCKED_ERROR = "Não foi possível entrar. Se o problema persistir, procure a TI."
 
 # Subcódigos do AD em "AcceptSecurityContext error, data XXX". Só 532/773 são
-# devolvidos com a senha CORRETA, então só eles ganham mensagem específica;
-# os demais (775 bloqueio, 533 desabilitada...) não podem revelar se a conta
-# existe (enumeração de usuários) e são apenas registrados no log.
+# devolvidos com a senha CORRETA, então só eles ganham mensagem específica.
+# O AD devolve 775 (bloqueio), 533 (desabilitada) etc. mesmo com senha ERRADA:
+# eles recebem a mensagem genérica (sem enumeração) e o subcódigo vai ao log.
 AD_BIND_ERRORS = {
-    "525": GENERIC_ERROR,
-    "52e": GENERIC_ERROR,
-    "530": BLOCKED_ERROR,
-    "531": BLOCKED_ERROR,
     "532": "Sua senha expirou. Altere-a em um computador da empresa e tente novamente.",
-    "533": BLOCKED_ERROR,
-    "701": BLOCKED_ERROR,
     "773": "É necessário trocar a senha antes do primeiro acesso.",
-    "775": BLOCKED_ERROR,
 }
 _DATA_RE = re.compile(r"data ([0-9a-f]{3})", re.IGNORECASE)
 

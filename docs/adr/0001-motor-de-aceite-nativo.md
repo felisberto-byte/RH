@@ -1,6 +1,6 @@
 # ADR 0001 — Aceite nativo no portal; DocuSeal só para modelos fixos
 
-**Situação:** aceita · **Data:** 2026-10-01
+**Situação:** aceita, com atualização ao final · **Data:** 2026-10-01
 
 ## Contexto
 
@@ -43,3 +43,28 @@ documento via API (valor não confirmado no site do fornecedor).
   evidência, não do rabisco (ver documento jurídico).
 - Se o DocuSeal for usado, ele vira mais um sistema para operar (VM, Postgres, backup,
   AGPL §13 se for modificado).
+
+## Atualização (revisão adversarial)
+
+A decisão se mantém. O caminho DocuSeal foi endurecido:
+
+- **Só modelos fixos:** um tipo com motor `docuseal` exige `docuseal_template_id`. O RH
+  emite as pendências por lista de matrículas (Área do RH → "DocuSeal"). O envio só é
+  criado quando o colaborador autenticado abre o documento e confirma a senha do AD (e o
+  TOTP, se o tipo exigir). Um novo link arquiva o envio anterior e expira em 2 horas.
+- **Token da API** só vai para `{DOCUSEAL_URL}/api/*`. Os downloads (URLs assinadas) vão
+  sem token, no mesmo esquema e host:porta da URL configurada, também nos
+  redirecionamentos (sem rebaixar https para http). Em produção a URL deve ser https.
+- **Todos os PDFs do envio** recebem o selo final do e-CNPJ. O primeiro é o documento
+  principal; os demais ficam em `evidencia.documento.arquivos_adicionais` e no dossiê.
+- **Recusa** (`form.declined`) registra a frase fixa `DECLINE_DECLARATION` e o motivo,
+  nunca a declaração de concordância.
+- **Vínculo com o AD:** vale o evento `DOCUSEAL_LINK_ABERTO` do **mesmo** signatário que
+  concluiu; sem ele nada é registrado (`DOCUSEAL_SEM_VINCULO_AD`). A evidência v2 traz os
+  fatores confirmados ao abrir o link, o horário local com fuso e a trilha do DocuSeal.
+- **Webhook** processado fora do laço de eventos (thread com sessão própria). Falha de
+  rede ou de selo responde 502 e o DocuSeal reenvia; os arquivos só são gravados depois
+  de todos gerados.
+- No DocuSeal, use `CERTS={"enabled":false}`: o único certificado é o selo do portal.
+
+Fluxo completo em `docs/arquitetura.md` (Fluxo DocuSeal).

@@ -1,6 +1,6 @@
 # ADR 0002 — Ordem e forma das assinaturas PAdES
 
-**Situação:** aceita · **Data:** 2026-10-01
+**Situação:** aceita, com atualização ao final · **Data:** 2026-10-01
 
 ## Contexto
 
@@ -40,3 +40,22 @@ assinatura. Testes com pyHanko 0.37 mostraram que:
 - A1 está sendo extinto (Res. CG ICP-Brasil 211/2024 → "Selo Eletrônico" SE-S/SE-H). A
   classe `Sealer` recebe qualquer `pyhanko.sign.Signer`, e trocar para SE-S, Cloud KMS
   ou PSC é uma mudança de construtor.
+
+## Atualização (revisão adversarial)
+
+A ordem foi mantida: certificação P=2 na emissão, assinatura do campo de aceite,
+comprovante separado com P=1 e, no DocuSeal, selo por último. Endurecimentos:
+
+- **Campo de aceite travado:** `AceiteColaborador` é criado com `/Lock` (FieldMDP para
+  todos os campos) e `DocMDP NO_CHANGES` após a assinatura; a assinatura de aceite declara
+  o mesmo valor. Depois do aceite só DSS/carimbos de documento (LTV) são admitidos.
+- **PDF de origem recusado** na emissão quando tem campos de formulário editáveis (com
+  P=2 poderiam ser preenchidos depois sem invalidar a certificação), quando já tem
+  assinaturas ou quando é criptografado. O RH deve enviar o PDF "achatado".
+- **Divergência no motor nativo:** o campo de aceite fica vazio; o registro é o
+  comprovante, com a frase fixa de divergência e o motivo.
+- **DocuSeal:** cada PDF do envio recebe o `SeloEmpresaFinal` (ver ADR 0001).
+- **Falha** de selo, de carimbo do tempo ou de armazenamento: nada é registrado e o
+  colaborador recebe mensagem para tentar de novo.
+- **LTV** exige ACT e `PORTAL_SIGNING_TRUST_ROOT_FILES` (raízes ICP-Brasil). A
+  verificação pública por upload valida as assinaturas com essas raízes.

@@ -1,6 +1,6 @@
 # ADR 0003 — Python + FastAPI + pyHanko, páginas renderizadas no servidor
 
-**Situação:** aceita · **Data:** 2026-10-01
+**Situação:** aceita, com atualização ao final · **Data:** 2026-10-01
 
 ## Contexto
 
@@ -34,3 +34,10 @@ Opções avaliadas:
   o Demoiselle Signer pode entrar como *sidecar* de validação sem trocar a stack.
 - Em celulares sem visualizador de PDF embutido, o colaborador usa "Baixar PDF".
   Melhoria futura: pdf.js empacotado localmente.
+
+## Atualização (revisão adversarial)
+
+A stack se mantém. Gatilhos, privilégios dos papéis e travas consultivas existem só no
+PostgreSQL, por isso o CI roda os testes também contra um PostgreSQL real, além do
+SQLite. Os logs saem em JSON estruturado (`PORTAL_LOG_FORMAT`, padrão `json` em
+produção) para o Cloud Logging.
