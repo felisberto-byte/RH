@@ -4,8 +4,9 @@
 <section class="card narrow">
   <h1>Aplicativo autenticador</h1>
   {% if enrolled %}
-    <div class="alert ok">Seu aplicativo autenticador está configurado.</div>
-    <p class="muted">Trocou de celular? Procure o RH/TI para redefinir.</p>
+    <div class="alert ok" role="status">Seu aplicativo autenticador está configurado{% if confirmed_at %} desde {{ fmt_dt(confirmed_at) }}{% endif %}.</div>
+    <p class="muted">Não reconhece essa configuração? Procure o RH imediatamente: alguém pode ter
+      usado sua senha. Trocou de celular? Peça ao RH/TI para redefinir.</p>
     {% if next %}<p><a class="btn" href="{{ next }}">Continuar</a></p>{% endif %}
   {% else %}
     <p>Para confirmar seus aceites, use um aplicativo autenticador (Google Authenticator,

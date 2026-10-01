@@ -24,6 +24,7 @@ from portal.web.deps import (
     find_employee_for,
     get_db,
     link_problem,
+    peek_user,
     render,
     require_csrf,
 )
@@ -262,6 +263,7 @@ def _verify_page(request: Request, status_code: int = 200, **context):
     cookie próprio (não interfere no formulário de login aberto em outra aba)."""
     token = secrets.token_urlsafe(24)
     context.setdefault("result", None)
+    context.setdefault("user", peek_user(request))  # só para o menu; não autoriza nada
     resp = render(request, "verificar.html", status_code=status_code, verify_csrf=token, **context)
     resp.set_cookie(
         security.VERIFY_CSRF_COOKIE,

@@ -15,7 +15,7 @@ from portal.documents.service import (
     IntegrityFailure,
     NotFound,
 )
-from portal.models import Acceptance, AuditEvent, DocStatus
+from portal.models import Acceptance, AuditEvent, DocStatus, Document
 from portal.signing.pades import (
     FIELD_ACCEPT,
     FIELD_ISSUE,
@@ -225,3 +225,19 @@ def test_totp_step_up(session, storage, settings, sealer, auth, seeded):
     ev = json.loads(acc.evidence_json)
     assert ev["termo_adesao"]["versao"] == "1"
     assert ev["manifestacao"]["declaracao_sha256"] == audit.sha256_hex(ev["manifestacao"]["declaracao"])
+
+
+def test_storage_outage_records_nothing(svc, seeded, auth, session, monkeypatch):
+    doc = issue(svc, seeded)
+    maria = actor_for(auth, "maria.silva", seeded["maria"].id)
+    svc.mark_viewed(doc, maria)
+
+    def broken_put(key, data, content_type="application/pdf"):
+        raise OSError("bucket indisponível")
+
+    monkeypatch.setattr(svc.storage, "put", broken_put)
+    with pytest.raises(DocumentError, match="Armazenamento indisponível"):
+        svc.accept(doc.id, maria, declaration_confirmed=True, password="dev")
+    session.expire_all()
+    assert session.get(Document, doc.id).status == DocStatus.PENDENTE
+    assert session.query(Acceptance).count() == 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -36,6 +37,8 @@ from portal.signing.anchors import resolve_placement
 from portal.signing.pades import Sealer, SealingError
 from portal.signing.receipt import ReceiptData, build_receipt_pdf
 from portal.storage import ObjectExistsError, Storage
+
+log = logging.getLogger(__name__)
 
 MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_PDF_PAGES = 200
@@ -231,6 +234,13 @@ class DocumentService:
         except ObjectExistsError as exc:
             if sha256_hex(self.storage.get(key)) != sha256_hex(data):
                 raise DocumentError(f"conflito no armazenamento ({key})") from exc
+        except Exception as exc:  # noqa: BLE001 - indisponibilidade do bucket/disco
+            log.exception("falha ao gravar %s no armazenamento", key)
+            self.db.rollback()
+            raise DocumentError(
+                "Armazenamento indisponível no momento. Nada foi registrado; tente novamente "
+                "em instantes."
+            ) from exc
 
     # ================================================================ emissão
     def _find_duplicate(

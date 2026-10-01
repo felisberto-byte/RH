@@ -105,3 +105,6 @@ code { font-family: ui-monospace, monospace; font-size: .9em; }
   clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .grid2 > div { min-width: 0; }
 details > summary { cursor: pointer; }
+.filters > *, .inline-form > * { min-width: 0; max-width: 100%; }
+.check-aligned { margin-top: 36px; }
+@media (max-width: 720px) { .check-aligned { margin-top: 8px; } }

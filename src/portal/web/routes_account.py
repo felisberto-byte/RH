@@ -234,7 +234,16 @@ def mfa_page(
         return RedirectResponse("/", status_code=303)
     totp = _totp(request, db)
     if totp.is_enrolled(user.employee.id):
-        return render(request, "mfa.html", user=user, enrolled=True, error=None, next=safe_next(next))
+        cred = totp.get(user.employee.id)
+        return render(
+            request,
+            "mfa.html",
+            user=user,
+            enrolled=True,
+            confirmed_at=cred.confirmed_at if cred else None,
+            error=None,
+            next=safe_next(next),
+        )
     secret, uri = totp.pending_uri(user.employee) or totp.start_enrollment(user.employee)
     return render(
         request,

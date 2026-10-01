@@ -43,7 +43,7 @@
   <div class="grid2">
     <div><label for="ret-{{ k }}">Retenção (anos)</label>
       <input id="ret-{{ k }}" name="retencao_anos" type="number" min="1" value="{{ t.retention_years if t else 10 }}"></div>
-    <div><label class="check" style="margin-top:36px"><input type="checkbox" name="ativo" value="sim" {{ "checked" if not t or t.ativo }}> Ativo</label></div>
+    <div><label class="check check-aligned"><input type="checkbox" name="ativo" value="sim" {{ "checked" if not t or t.ativo }}> Ativo</label></div>
   </div>
   <button class="btn primary" type="submit">{{ "Salvar alterações" if t else "Criar tipo" }}</button>
 </form>
